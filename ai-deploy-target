@@ -52,7 +52,7 @@ import urllib.request
 from pathlib import Path
 
 PROG = "ai-deploy-target"
-FALLBACK_VERSION = "0.3.0"
+FALLBACK_VERSION = "0.3.1"
 APP_SCHEMA = "ai-deploy-apps/2"
 
 DEPLOY_USER = "ai-deploy"
@@ -750,6 +750,7 @@ def unit_content(runner, name, exec_argv, port):
         f"User=app-{name}\n"
         f"Group=app-{name}\n"
         f"WorkingDirectory={app_root_path(runner, name)}/current\n"
+        f"EnvironmentFile=-{app_root_path(runner, name)}/current/.ai-deploy.env\n"
         f"EnvironmentFile=-{runner.target(CONFIG_DIR)}/{name}.env\n"
         f"Environment=PORT={port}\n"
         f"ExecStart={exec_line}\n"
@@ -908,6 +909,11 @@ def ensure_deploy_user(runner):
                       "--comment", "ai-deploy forced-command account", DEPLOY_USER)
     runner.mutate("passwd", "-l", DEPLOY_USER)
     runner.mutate("chown", f"{DEPLOY_USER}:{DEPLOY_USER}", home)
+    # `ai-remote logs` runs journalctl as ai-deploy: read-only journal access (group systemd-journal).
+    if runner.run("getent", "group", "systemd-journal").ok and \
+            not user_in_group(runner, DEPLOY_USER, "systemd-journal"):
+        runner.mutate("usermod", "-aG", "systemd-journal", DEPLOY_USER)
+        say(f"added {DEPLOY_USER} to systemd-journal (read-only app logs)")
 
 
 def install_package_files(runner):

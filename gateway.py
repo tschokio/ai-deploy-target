@@ -57,8 +57,8 @@ def _package_version():
     try:
         text = (Path(__file__).resolve().parent / "VERSION").read_text(encoding="utf-8").strip()
     except OSError:
-        return "0.3.0"
-    return text or "0.3.0"
+        return "0.3.1"
+    return text or "0.3.1"
 
 
 VERSION = _package_version()
@@ -787,14 +787,41 @@ def git_env(cfg, paths):
     return env
 
 
-def build_env(cfg, paths):
+def build_env(cfg, paths, commit=None):
     env = {
         "PATH": DEFAULT_PATH,
         "HOME": os.environ.get("HOME") or str(paths.root),
         "LANG": os.environ.get("LANG") or "C.UTF-8",
     }
     env.update(cfg.get("env") or {})
+    env.update(commit or {})
     return env
+
+
+def commit_metadata(cfg, paths, sha, ref=None):
+    """Build/runtime metadata for the exact commit (the release has no .git): GIT_COMMIT_HASH etc."""
+    meta = {"GIT_COMMIT_HASH": sha, "AI_DEPLOY_APP": cfg["app"]}
+    result = run_capped([git_bin(), f"--git-dir={paths.mirror}", "show", "-s", "--format=%s%n%cI", sha],
+                        timeout=30, env=git_env(cfg, paths), cap=4096)
+    if result.ok:
+        lines = (result.out or "").splitlines()
+        if lines:
+            meta["GIT_COMMIT_MESSAGE"] = redact(lines[0])[:200]
+        if len(lines) > 1:
+            meta["GIT_COMMIT_DATE"] = lines[1].strip()[:40]
+    if ref and REF_RE.fullmatch(ref):
+        meta["GIT_BRANCH"] = ref
+    return {key: "".join(ch for ch in value if ch.isprintable() and ch not in "\"'")
+            for key, value in meta.items()}
+
+
+def write_commit_env(release, meta):
+    """<release>/.ai-deploy.env: KEY=value lines, loadable as a systemd EnvironmentFile or by compose."""
+    try:
+        (release / ".ai-deploy.env").write_text(
+            "".join(f"{key}={value}\n" for key, value in sorted(meta.items())), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def ensure_mirror(cfg, paths, steps):
@@ -854,7 +881,7 @@ def make_release(cfg, paths, sha):
     return name, release
 
 
-def run_build(cfg, paths, release, steps):
+def run_build(cfg, paths, release, steps, commit=None):
     build = cfg["build"]
     if not build:
         steps.append({"step": "build", "ok": True, "detail": "no build configured"})
@@ -867,7 +894,7 @@ def run_build(cfg, paths, release, steps):
             raise GatewayError("build_failed",
                                f"build step {index}/{total} skipped: buildTimeout exhausted")
         result = run_capped(
-            argv, timeout=remaining, cwd=release, env=build_env(cfg, paths),
+            argv, timeout=remaining, cwd=release, env=build_env(cfg, paths, commit),
             cap=BUILD_OUTPUT_CAP, tail=True,
         )
         if not result.ok:
@@ -1173,8 +1200,10 @@ def op_deploy(request, apps):
             raise
         steps.append({"step": "export", "ok": True, "detail": f"releases/{name}"})
         relabel_release(release, steps, "extract")
+        commit = commit_metadata(cfg, paths, sha, request.get("ref"))
+        write_commit_env(release, commit)
         try:
-            run_build(cfg, paths, release, steps)
+            run_build(cfg, paths, release, steps, commit)
         except GatewayError as exc:
             shutil.rmtree(release, ignore_errors=True)
             history_append(paths, {"op": "deploy", "app": app, "sha": sha,
