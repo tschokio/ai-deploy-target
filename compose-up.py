@@ -54,8 +54,8 @@ def _package_version():
     try:
         text = (Path(__file__).resolve().parent / "VERSION").read_text(encoding="utf-8").strip()
     except OSError:
-        return "0.2.0"
-    return text or "0.2.0"
+        return "0.2.1"
+    return text or "0.2.1"
 
 
 VERSION = _package_version()

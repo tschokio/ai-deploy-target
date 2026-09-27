@@ -48,7 +48,7 @@ import urllib.request
 from pathlib import Path
 
 PROG = "ai-deploy-target"
-FALLBACK_VERSION = "0.2.0"
+FALLBACK_VERSION = "0.2.1"
 APP_SCHEMA = "ai-deploy-apps/2"
 
 DEPLOY_USER = "ai-deploy"
@@ -933,8 +933,17 @@ def write_deploy_authorized_keys(runner, keys, additive):
 
 def setup_admin_user(runner, args):
     default_user = os.environ.get("SUDO_USER") or None
+    if default_user == "root":
+        default_user = None
     admin_user = args.admin_user or ask(
         runner, "Admin user that can log in and run sudo", default=default_user, required=True)
+    if admin_user == "root":
+        # The admin level is a normal account that authenticates with a key and then needs its own sudo
+        # password; root would also make "disable root login" lock out the only admin.
+        raise Fail("the admin user must be a normal account, not root: pass e.g. `--admin-user domi` "
+                   "(an existing sudo user, or a new one this tool creates and asks a password for)", 2)
+    if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", admin_user):
+        raise Fail(f"invalid admin user name {admin_user!r}", 2)
     sudo_group = "sudo" if runner.os_info.get("family") == "debian" else "wheel"
     if user_exists(runner, admin_user):
         say(f"user {admin_user} exists")
@@ -980,9 +989,12 @@ def setup_admin_user(runner, args):
     return admin_user
 
 
-def setup_root_login(runner, args):
+def setup_root_login(runner, args, admin_user=None):
     if args.no_root_login_change:
         say("root login change skipped (--no-root-login-change)")
+        return
+    if not admin_user or admin_user == "root":
+        say("root login left unchanged (no separate admin user configured)")
         return
     dropin = runner.target(SSHD_DROPIN)
     if args.root_login_change:
@@ -1007,8 +1019,21 @@ def setup_root_login(runner, args):
         detail = (proc.err or proc.out).strip()
         remove_file(runner, dropin)
         raise Fail(f"sshd rejected the config; removed the drop-in: {detail or 'exit %d' % proc.rc}")
-    runner.mutate("systemctl", "reload", service)
-    say(f"PermitRootLogin no applied; reloaded {service}")
+    # Socket-activated sshd (newer Debian/Ubuntu: ssh.socket, ssh.service inactive) reads the config for every
+    # new connection, so nothing needs reloading; `systemctl reload` would fail on the inactive service.
+    if runner.run("systemctl", "is-active", "--quiet", service).ok:
+        reload = runner.run("systemctl", "reload", service)
+        if not reload.ok:
+            remove_file(runner, dropin)
+            runner.run("systemctl", "reload", service)
+            detail = (reload.err or reload.out).strip().splitlines()
+            raise Fail(f"`systemctl reload {service}` failed, so the drop-in was removed again and root login is "
+                       f"unchanged: {detail[-1] if detail else 'exit %d' % reload.rc}")
+        say(f"PermitRootLogin no applied; reloaded {service}")
+    else:
+        say(f"PermitRootLogin no applied ({service}.service is socket-activated or inactive: new connections "
+            f"read the new config)")
+    say(f"undo: sudo rm {dropin} (then `systemctl reload {service}` if it is running)")
 
 
 def cmd_bootstrap(runner, args):
@@ -1037,8 +1062,8 @@ def cmd_bootstrap(runner, args):
     write_deploy_authorized_keys(runner, parsed, additive)
     say(f"installed {len(parsed)} managed line(s) in {deploy_authorized_keys_path(runner)}")
 
-    setup_admin_user(runner, args)
-    setup_root_login(runner, args)
+    admin_user = setup_admin_user(runner, args)
+    setup_root_login(runner, args, admin_user)
     handle_selinux(runner)
 
     say("")
