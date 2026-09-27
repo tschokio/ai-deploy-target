@@ -1,0 +1,1822 @@
+#!/usr/bin/env python3
+"""ai-deploy-target — guided setup for a Debian/Ubuntu or Rocky Linux deploy target.
+
+Run as root ON the target machine (the machine the forced-command gateway deploys to):
+
+    sudo ./ai-deploy-target bootstrap
+    sudo ./ai-deploy-target app add my-app
+    sudo ./ai-deploy-target app list
+    sudo ./ai-deploy-target doctor
+    ./ai-deploy-target --version
+
+Every command is interactive by default (prompts show a [default]); --yes accepts the
+defaults (and fails when a required answer has no default and no flag). --check prints
+the plan and changes nothing, but still validates the inputs.
+
+Test mode
+---------
+`--root DIR` (with the environment variable AI_DEPLOY_TARGET_TEST=1) prefixes every
+file path with DIR and resolves every system command from PATH, so tests can drop fake
+scripts there. It never touches the real system. `chown`/`useradd` are just as fake as
+everything else.
+
+Real mode
+---------
+System commands are looked up once with shutil.which and a clear error (plus the apt/dnf
+install command) is reported when a required command is missing.
+"""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import glob
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shlex
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+PROG = "ai-deploy-target"
+FALLBACK_VERSION = "0.2.0"
+APP_SCHEMA = "ai-deploy-apps/2"
+
+DEPLOY_USER = "ai-deploy"
+DEPLOY_HOME = "/srv/ai-deploy"
+LIB_DIR = "/usr/local/lib/ai-deploy"
+GATEWAY_PATH = LIB_DIR + "/gateway"
+COMPOSE_UP_PATH = LIB_DIR + "/compose-up"
+INSTALLED_VERSION_PATH = LIB_DIR + "/VERSION"
+CONFIG_DIR = "/etc/ai-deploy"
+CONFIG_PATH = CONFIG_DIR + "/apps.json"
+SUDOERS_PATH = "/etc/sudoers.d/ai-deploy"
+NGINX_CONF_DIR = "/etc/nginx/conf.d"
+SSHD_DROPIN = "/etc/ssh/sshd_config.d/50-ai-deploy.conf"
+
+APP_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@._-]{0,127}$")
+
+KEY_TYPES = (
+    "ssh-ed25519",
+    "ssh-rsa",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+)
+MANAGED_COMMENT = "ai-remote-deploy"
+
+# Published GitHub host keys (https://api.github.com/meta, 2026-09-27).
+GITHUB_KNOWN_HOSTS = (
+    "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl",
+    "github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=",
+    "github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=",
+)
+
+DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+class Fail(Exception):
+    """Explicit failure with an exit code (1 failure, 2 usage, 3 not root)."""
+
+    def __init__(self, message, code=1):
+        super().__init__(message)
+        self.code = code
+
+
+class Proc:
+    __slots__ = ("rc", "out", "err")
+
+    def __init__(self, rc, out="", err=""):
+        self.rc = rc
+        self.out = out or ""
+        self.err = err or ""
+
+    @property
+    def ok(self):
+        return self.rc == 0
+
+
+def say(message=""):
+    print(message, flush=True)   # keep stdout ordered with errors on stderr
+
+
+def plan(message):
+    print("plan: " + message)
+
+
+# --------------------------------------------------------------------------
+# runner: the single place every system command goes through
+
+
+class Runner:
+    def __init__(self, root, test_mode, check, yes):
+        self.root = root
+        self.test_mode = test_mode
+        self.check = check
+        self.yes = yes
+        self.os_info = {}
+        self._tools = {}
+        self._gateway = None
+
+    # -- paths -----------------------------------------------------------
+    def target(self, path):
+        if self.root == "/" or not path.startswith("/"):
+            return path
+        return self.root.rstrip("/") + path
+
+    # -- command lookup --------------------------------------------------
+    def which(self, name):
+        if name not in self._tools:
+            self._tools[name] = shutil.which(name)
+        return self._tools[name]
+
+    def have(self, name):
+        return self.which(name) is not None
+
+    def install_hint(self, packages):
+        family = (self.os_info or {}).get("family")
+        pkgs = " ".join(packages)
+        if family == "debian":
+            return f" — install it with: apt-get -y install {pkgs}"
+        if family == "rocky":
+            return f" — install it with: dnf -y install {pkgs}"
+        return f" — install: {pkgs}" if packages else ""
+
+    def require(self, name, packages=()):
+        path = self.which(name)
+        if path is None:
+            raise Fail(f"{name} is not available" + self.install_hint(packages or (name,)))
+        return path
+
+    # -- execution -------------------------------------------------------
+    def run(self, name, *args, env=None, input=None, capture=True, timeout=None):
+        """Execute a command, always (used for probes / validation)."""
+        path = self.which(name)
+        if path is None:
+            raise Fail(f"{name} is not available" + self.install_hint((name,)))
+        argv = [path, *[str(a) for a in args]]
+        try:
+            if not capture:
+                proc = subprocess.run(argv, env=env, input=input, timeout=timeout)
+                return Proc(proc.returncode)
+            proc = subprocess.run(argv, env=env, input=input, capture_output=True, text=True,
+                                  timeout=timeout)
+            return Proc(proc.returncode, proc.stdout, proc.stderr)
+        except subprocess.TimeoutExpired:
+            return Proc(124, "", f"timeout after {timeout}s")
+
+    def mutate(self, name, *args, env=None, input=None, ignore_failure=False):
+        """Run a command that changes the system; under --check only print it."""
+        if self.check:
+            plan(f"{name} {' '.join(shlex.quote(str(a)) for a in args)}".rstrip())
+            return Proc(0)
+        proc = self.run(name, *args, env=env, input=input)
+        if not proc.ok:
+            text = (proc.err or proc.out).strip()
+            if ignore_failure:
+                say(f"warning: {name} failed: {text or 'exit %d' % proc.rc}")
+            else:
+                raise Fail(f"{name} failed: {text or 'exit %d' % proc.rc}")
+        return proc
+
+    def interactive(self, name, *args):
+        """Run an interactive command with inherited stdio (e.g. passwd)."""
+        if self.check:
+            plan(f"{name} {' '.join(shlex.quote(str(a)) for a in args)}".rstrip())
+            return Proc(0)
+        return self.run(name, *args, capture=False)
+
+
+# --------------------------------------------------------------------------
+# input helpers
+
+
+def _read(prompt, secret=False):
+    try:
+        return getpass.getpass(prompt) if secret else input(prompt)
+    except EOFError:
+        raise Fail("interactive input required but stdin is closed; use --yes with flags", 2)
+
+
+def ask(runner, prompt, default=None, required=True, secret=False):
+    if runner.yes:
+        if default is not None:
+            return default
+        if not required:
+            return None
+        raise Fail(f"--yes was given but '{prompt}' has no default; pass the matching flag", 2)
+    while True:
+        text = f"{prompt} [{default}]: " if default is not None else f"{prompt}: "
+        value = _read(text, secret).strip()
+        if value:
+            return value
+        if default is not None:
+            return default
+        if not required:
+            return None
+        say("a value is required")
+
+
+def confirm(runner, prompt, default=False):
+    if runner.yes:
+        return default
+    suffix = " [Y/n]: " if default else " [y/N]: "
+    while True:
+        answer = _read(prompt + suffix).strip().lower()
+        if not answer:
+            return default
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            return False
+        say("please answer y or n")
+
+
+def confirm_action(runner, prompt):
+    """A destructive action: --yes means yes, otherwise ask (default no)."""
+    if runner.yes:
+        return True
+    return confirm(runner, prompt, default=False)
+
+
+def wait_enter(runner, prompt):
+    if runner.yes or runner.check:
+        return
+    _read(prompt + " ")
+
+
+def ask_choice(runner, prompt, choices, default):
+    if runner.yes:
+        return default
+    while True:
+        value = ask(runner, f"{prompt} ({'/'.join(choices)})", default=default)
+        if value in choices:
+            return value
+        say("choose one of: " + ", ".join(choices))
+
+
+# --------------------------------------------------------------------------
+# OS detection
+
+
+def detect_os(runner):
+    path = runner.target("/etc/os-release")
+    info = {"id": "", "id_like": "", "version": "", "family": None, "pkg_mgr": None}
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return info
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        value = value.strip().strip('"').strip("'")
+        if key == "ID":
+            info["id"] = value.lower()
+        elif key == "ID_LIKE":
+            info["id_like"] = value.lower()
+        elif key == "VERSION_ID":
+            info["version"] = value
+    tokens = set((info["id"] + " " + info["id_like"]).split())
+    if tokens & {"debian", "ubuntu"} or any(t.startswith("debian") for t in tokens):
+        info["family"] = "debian"
+        info["pkg_mgr"] = "apt-get"
+    elif tokens & {"rocky", "rhel", "almalinux", "centos", "fedora"}:
+        info["family"] = "rocky"
+        info["pkg_mgr"] = "dnf"
+    return info
+
+
+def package_manager(runner):
+    info = runner.os_info or detect_os(runner)
+    manager = info.get("pkg_mgr")
+    if not manager:
+        raise Fail("cannot detect the OS package manager from /etc/os-release")
+    return manager
+
+
+def install_packages(runner, packages, reason):
+    manager = package_manager(runner)
+    say(f"{reason}; installing with {manager}: {' '.join(packages)}")
+    runner.mutate(manager, "-y", "install", *packages)
+
+
+# --------------------------------------------------------------------------
+# package / file helpers
+
+
+def package_version():
+    override = os.environ.get("AI_DEPLOY_TARGET_VERSION")
+    if override:
+        return override
+    path = Path(__file__).resolve().parent / "VERSION"
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return FALLBACK_VERSION
+    return text if re.fullmatch(r"[0-9A-Za-z.+_-]{1,32}", text) else FALLBACK_VERSION
+
+
+def ensure_dir(runner, path, mode=0o755, owner=None):
+    if runner.check:
+        plan(f"mkdir -p {path} (mode {mode:o}{', owner ' + owner if owner else ''})")
+        return
+    os.makedirs(path, exist_ok=True)
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+    if owner:
+        runner.mutate("chown", owner, path)
+
+
+def write_file(runner, path, content, mode, owner=None):
+    """Atomic, idempotent write; under --check only print the plan. Returns True if changed."""
+    data = content.encode("utf-8") if isinstance(content, str) else bytes(content)
+    if runner.check:
+        plan(f"write {path} (mode {mode:o}, {len(data)} bytes)")
+        return False
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    tmp = os.path.join(parent, f".{os.path.basename(path)}.tmp.{os.getpid()}")
+    with open(tmp, "wb") as handle:
+        handle.write(data)
+    os.chmod(tmp, mode)
+    changed = True
+    try:
+        if os.path.exists(path):
+            with open(path, "rb") as handle:
+                if handle.read() == data:
+                    changed = False
+    except OSError:
+        changed = True
+    if changed:
+        os.replace(tmp, path)
+        say(f"wrote: {path} (mode {mode:o})")
+    else:
+        os.unlink(tmp)
+        say(f"unchanged: {path}")
+    if owner:
+        runner.mutate("chown", owner, path)
+    return changed
+
+
+def read_file(path, default=None):
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return default
+
+
+def remove_file(runner, path):
+    if runner.check:
+        plan(f"rm -f {path}")
+        return
+    try:
+        os.unlink(path)
+        say(f"removed: {path}")
+    except FileNotFoundError:
+        pass
+
+
+def remove_tree(runner, path):
+    if runner.check:
+        plan(f"rm -rf {path}")
+        return
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path, ignore_errors=True)
+        say(f"removed: {path}")
+
+
+def install_source(runner, src, dest, mode, owner="root:root"):
+    src = Path(src)
+    if not src.exists():
+        if runner.test_mode:
+            say(f"warning: {src.name} is not next to the tool; skipping {dest} in test mode")
+            return
+        raise Fail(f"package file {src} is missing (incomplete ai-deploy-target package)")
+    write_file(runner, dest, src.read_bytes(), mode, owner=owner)
+
+
+# --------------------------------------------------------------------------
+# users
+
+
+def getent_passwd(runner, user):
+    proc = runner.run("getent", "passwd", user)
+    if not proc.ok:
+        return None
+    fields = proc.out.strip().split(":")
+    if len(fields) < 7:
+        return None
+    return {"name": fields[0], "home": fields[5], "shell": fields[6]}
+
+
+def user_exists(runner, user):
+    return runner.run("getent", "passwd", user).ok
+
+
+def user_in_group(runner, user, group):
+    proc = runner.run("id", "-nG", user)
+    return proc.ok and group in proc.out.split()
+
+
+def nologin_path(runner):
+    for candidate in ("/usr/sbin/nologin", "/sbin/nologin"):
+        if os.path.exists(runner.target(candidate)):
+            return runner.target(candidate)
+    return "/usr/sbin/nologin"
+
+
+def warn_no_password(runner, user):
+    proc = runner.run("getent", "shadow", user)
+    if not proc.ok:
+        return
+    fields = proc.out.strip().split(":")
+    if len(fields) >= 2 and fields[1] in ("", "!", "!!", "*", "NP"):
+        say(f"warning: user {user} has no usable password; sudo login (and thus the deploy "
+            f"path) will not work until one is set with `passwd {user}`")
+
+
+# --------------------------------------------------------------------------
+# public keys
+
+
+def validate_public_key(runner, line):
+    """Return (type, blob) for a single, plain OpenSSH public-key line."""
+    line = (line or "").strip()
+    if not line:
+        raise Fail("empty public key")
+    if "\n" in line or "\r" in line:
+        raise Fail("a public key must be a single line")
+    parts = line.split()
+    first = parts[0] if parts else ""
+    if '"' in line or "'" in line or "=" in first or "," in first:
+        raise Fail("public key must be a plain line without options, quotes or commas")
+    if len(parts) < 2:
+        raise Fail("not an OpenSSH public key line")
+    key_type, blob = parts[0], parts[1]
+    if key_type not in KEY_TYPES:
+        raise Fail(f"unsupported key type {key_type!r} (use ssh-ed25519)")
+    if not re.fullmatch(r"[A-Za-z0-9+/]+={0,3}", blob):
+        raise Fail("public key body is not valid base64")
+    handle, tmp = tempfile.mkstemp(prefix="ai-deploy-key.", suffix=".pub")
+    try:
+        os.write(handle, (line + "\n").encode("utf-8"))
+    finally:
+        os.close(handle)
+    try:
+        proc = runner.run("ssh-keygen", "-lf", tmp)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    if not proc.ok:
+        raise Fail("ssh-keygen rejected the public key")
+    bits = 0
+    match = re.match(r"^(\d+)\s+", proc.out.strip())
+    if match:
+        bits = int(match.group(1))
+    if key_type == "ssh-rsa" and bits and bits < 3072:
+        raise Fail(f"RSA key is only {bits} bits; use at least 3072 (or ssh-ed25519)")
+    if key_type != "ssh-ed25519":
+        say(f"warning: {key_type} accepted, but ssh-ed25519 is preferred")
+    return key_type, blob
+
+
+def validate_host_key_line(runner, line):
+    handle, tmp = tempfile.mkstemp(prefix="ai-deploy-hostkey.")
+    try:
+        os.write(handle, (line.strip() + "\n").encode("utf-8"))
+        os.close(handle)
+        proc = runner.run("ssh-keygen", "-lf", tmp)
+        if not proc.ok:
+            raise Fail("ssh-keygen rejected the host key line")
+        say("host key fingerprint: " + proc.out.strip())
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def deploy_authorized_keys_path(runner):
+    return runner.target(DEPLOY_HOME) + "/.ssh/authorized_keys"
+
+
+def gateway_command(runner):
+    return runner.target(GATEWAY_PATH)
+
+
+def managed_authorized_keys_line(runner, key_type, blob):
+    return f'restrict,command="{gateway_command(runner)}" {key_type} {blob} {MANAGED_COMMENT}'
+
+
+def existing_managed_keys(runner):
+    content = read_file(deploy_authorized_keys_path(runner), "") or ""
+    prefix = 'restrict,command="' + gateway_command(runner) + '"'
+    return [line.strip() for line in content.splitlines() if line.strip().startswith(prefix)]
+
+
+# --------------------------------------------------------------------------
+# gateway validation of apps.json
+
+
+def gateway_module(runner):
+    if runner._gateway is not None:
+        return runner._gateway
+    if runner.test_mode:
+        path = Path(__file__).resolve().parent / "gateway.py"
+    else:
+        installed = Path(runner.target(GATEWAY_PATH))
+        path = installed if installed.exists() else Path(__file__).resolve().parent / "gateway.py"
+    if not path.exists():
+        raise Fail(f"cannot validate apps.json: gateway not found at {path}")
+    # The installed gateway has no .py suffix, so name the source loader explicitly.
+    loader = importlib.machinery.SourceFileLoader("ai_deploy_gateway_loader", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    previous_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous_bytecode
+    runner._gateway = module
+    return module
+
+
+def validate_gateway(runner, config_path):
+    module = gateway_module(runner)
+    previous = os.environ.get("AI_DEPLOY_CONFIG")
+    os.environ["AI_DEPLOY_CONFIG"] = config_path
+    try:
+        module.load_apps()
+    except Exception as exc:  # noqa: BLE001 - surface the loader's message
+        detail = getattr(exc, "detail", None) or str(exc)
+        raise Fail(f"apps.json rejected by the gateway: {detail}")
+    finally:
+        if previous is None:
+            os.environ.pop("AI_DEPLOY_CONFIG", None)
+        else:
+            os.environ["AI_DEPLOY_CONFIG"] = previous
+
+
+def serialize_document(document):
+    return json.dumps(document, indent=2, ensure_ascii=False) + "\n"
+
+
+def validate_document(runner, document):
+    """Validate a whole apps.json document without touching the target state."""
+    data = serialize_document(document)
+    if runner.check:
+        directory = tempfile.gettempdir()
+    else:
+        directory = os.path.dirname(runner.target(CONFIG_PATH))
+        os.makedirs(directory, exist_ok=True)
+    handle, tmp = tempfile.mkstemp(prefix=".ai-deploy-apps.json.", dir=directory)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(data)
+        os.chmod(tmp, 0o644)
+        validate_gateway(runner, tmp)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def install_document(runner, document):
+    path = runner.target(CONFIG_PATH)
+    ensure_dir(runner, os.path.dirname(path), 0o755)
+    if runner.check:
+        plan(f"write {path} (mode 644)")
+        return
+    data = serialize_document(document)
+    directory = os.path.dirname(path)
+    handle, tmp = tempfile.mkstemp(prefix=".apps.json.", dir=directory)
+    with os.fdopen(handle, "w", encoding="utf-8") as stream:
+        stream.write(data)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+    say(f"wrote: {path}")
+
+
+def load_document(runner):
+    content = read_file(runner.target(CONFIG_PATH))
+    if content is None:
+        return None
+    try:
+        document = json.loads(content)
+    except ValueError as exc:
+        raise Fail(f"{runner.target(CONFIG_PATH)} is not valid JSON: {exc}")
+    if not isinstance(document, dict):
+        raise Fail(f"{runner.target(CONFIG_PATH)} must contain a JSON object")
+    document.setdefault("schema", APP_SCHEMA)
+    if not isinstance(document.get("apps"), dict):
+        document["apps"] = {}
+    return document
+
+
+def empty_document():
+    return {"schema": APP_SCHEMA, "apps": {}}
+
+
+# --------------------------------------------------------------------------
+# sudoers / units / selinux
+
+
+# Must be exactly the path the gateway executes (gateway.py restart_unit), or sudo refuses the rule.
+GATEWAY_SYSTEMCTL = "/usr/bin/systemctl"
+
+
+def sudoers_systemctl_path(runner):
+    if runner.test_mode:
+        return runner.require("systemctl", ["systemd"])
+    if not os.path.exists(GATEWAY_SYSTEMCTL):
+        raise Fail(f"{GATEWAY_SYSTEMCTL} is missing; the gateway restarts units with exactly that path")
+    return GATEWAY_SYSTEMCTL
+
+
+def regenerate_sudoers(runner, document):
+    rules = []
+    for name in sorted(document.get("apps", {})):
+        app = document["apps"][name]
+        kind = app.get("kind", "service")
+        if kind == "service":
+            unit = app.get("unit")
+            if not unit:
+                continue
+            rules.append(
+                f"{DEPLOY_USER} ALL=(root) NOPASSWD: {sudoers_systemctl_path(runner)} "
+                f"restart {unit}")
+        elif kind == "compose":
+            rules.append(
+                f"{DEPLOY_USER} ALL=(root) NOPASSWD: "
+                f"{runner.target(COMPOSE_UP_PATH)} {name}")
+    path = runner.target(SUDOERS_PATH)
+    if not rules:
+        if os.path.exists(path) or runner.check:
+            remove_file(runner, path)
+            say("no restartable units or compose apps; sudoers left without ai-deploy rules")
+        return
+    header = (f"# Managed by {PROG}. Generated from {runner.target(CONFIG_PATH)} — "
+              f"do not edit by hand.\n")
+    content = header + "\n".join(rules) + "\n"
+    if runner.check:
+        plan(f"write {path} (mode 440) with:")
+        for rule in rules:
+            say("    " + rule)
+        return
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    handle, tmp = tempfile.mkstemp(prefix=".ai-deploy.sudoers.", dir=directory)
+    with os.fdopen(handle, "w", encoding="utf-8") as stream:
+        stream.write(content)
+    os.chmod(tmp, 0o440)
+    visudo = runner.which("visudo")
+    if visudo is None:
+        os.unlink(tmp)
+        raise Fail("visudo is not available" + runner.install_hint(("sudo",)))
+    proc = runner.run("visudo", "-cf", tmp)
+    if not proc.ok:
+        os.unlink(tmp)
+        detail = (proc.err or proc.out).strip()
+        raise Fail(f"visudo rejected the generated sudoers file: {detail or 'exit %d' % proc.rc}")
+    os.replace(tmp, path)
+    os.chmod(path, 0o440)
+    say(f"wrote: {path} (mode 440)")
+    for rule in rules:
+        say("    " + rule)
+
+
+def nologin_home(user):
+    return "/nonexistent"
+
+
+def ensure_app_user(runner, name):
+    user = "app-" + name
+    if user_exists(runner, user):
+        return user
+    shell = nologin_path(runner)
+    runner.mutate("useradd", "--system", "--no-create-home", "--home-dir", nologin_home(user),
+                  "--shell", shell, user)
+    return user
+
+
+def app_env_path(runner, name):
+    return runner.target(CONFIG_DIR) + f"/{name}.env"
+
+
+def app_root_path(runner, name):
+    return runner.target(DEPLOY_HOME) + f"/{name}"
+
+
+def unit_content(runner, name, exec_argv, port):
+    exec_line = " ".join(shlex.quote(str(part)) for part in exec_argv)
+    return (
+        "[Unit]\n"
+        f"Description=ai-deploy application {name}\n"
+        "After=network-online.target\n"
+        "Wants=network-online.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"User=app-{name}\n"
+        f"Group=app-{name}\n"
+        f"WorkingDirectory={app_root_path(runner, name)}/current\n"
+        f"EnvironmentFile=-{runner.target(CONFIG_DIR)}/{name}.env\n"
+        f"Environment=PORT={port}\n"
+        f"ExecStart={exec_line}\n"
+        "Restart=on-failure\n"
+        "RestartSec=2\n"
+        "NoNewPrivileges=yes\n"
+        "ProtectSystem=full\n"
+        "ProtectHome=yes\n"
+        "PrivateTmp=yes\n"
+        f"StateDirectory={service_state_dir(name)}\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    )
+
+
+def service_state_dir(name):
+    return "ai-app-" + name
+
+
+def reseed_systemd(runner):
+    runner.mutate("systemctl", "daemon-reload")
+
+
+SELINUX_FCONTEXT_RULES = (
+    ("ssh_home_t", r"/srv/ai-deploy/\.ssh(/.*)?"),
+    ("bin_t", r"/srv/ai-deploy/[^/]+/releases/[^/]+/(\.venv/bin|node_modules/\.bin)(/.*)?"),
+    ("httpd_sys_content_t", r"/srv/ai-deploy/[^/]+/releases(/.*)?"),
+)
+
+
+def handle_selinux(runner):
+    if not runner.have("getenforce"):
+        return
+    mode = runner.run("getenforce").out.strip()
+    if mode not in ("Enforcing", "Permissive"):
+        say(f"SELinux is {mode or 'disabled'}; no fcontext rules needed")
+        return
+    say(f"SELinux is {mode}; registering ai-deploy fcontext rules")
+    if not runner.have("semanage"):
+        say("warning: semanage is not available; install policycoreutils-python-utils and re-run")
+        return
+    for context, pattern in SELINUX_FCONTEXT_RULES:
+        added = runner.mutate("semanage", "fcontext", "-a", "-t", context, pattern,
+                              ignore_failure=True)
+        if not added.ok and not runner.check:
+            runner.mutate("semanage", "fcontext", "-m", "-t", context, pattern,
+                          ignore_failure=True)
+    runner.mutate("restorecon", "-R", runner.target(DEPLOY_HOME), ignore_failure=True)
+
+
+# --------------------------------------------------------------------------
+# host keys
+
+
+def host_key_files(runner):
+    return sorted(glob.glob(runner.target("/etc/ssh/ssh_host_*_key.pub")))
+
+
+def print_host_key_fingerprints(runner):
+    files = host_key_files(runner)
+    if not files and not runner.test_mode:
+        # A freshly installed openssh-server that never started has no host keys yet.
+        say("no SSH host keys yet; generating them with `ssh-keygen -A`")
+        runner.mutate("ssh-keygen", "-A", ignore_failure=True)
+        files = host_key_files(runner)
+    if not files:
+        say("no /etc/ssh/ssh_host_*_key.pub found; check that openssh-server generated host keys")
+        return None
+    ed25519 = None
+    for path in files:
+        proc = runner.run("ssh-keygen", "-lf", path)
+        line = proc.out.strip() or f"warning: cannot read {path}"
+        say(f"  {line}")
+        if "ed25519" in os.path.basename(path):
+            ed25519 = line
+    if ed25519:
+        say("")
+        say("Next on the VM: type this ED25519 fingerprint into `ai-remote onboard <machine>`")
+        say(f"  {ed25519}")
+    return ed25519
+
+
+# --------------------------------------------------------------------------
+# bootstrap
+
+
+PREREQUISITE_CHECKS = (
+    ("python3", "python3"),
+    ("git", "git"),
+    ("sudo", "sudo"),
+    ("sshd", "openssh-server"),
+    ("tar", "tar"),   # the gateway exports each release with `git archive | tar -x`
+)
+
+
+def bootstrap_prerequisites(runner):
+    missing = []
+    for command, package in PREREQUISITE_CHECKS:
+        if not runner.have(command):
+            missing.append(package)
+    if runner.os_info.get("family") == "rocky" and not runner.have("semanage"):
+        missing.append("policycoreutils-python-utils")
+    missing = sorted(set(missing))
+    if not missing:
+        say("prerequisites: all present")
+        return
+    say("missing prerequisites: " + ", ".join(missing))
+    if confirm(runner, "install them now?", default=True):
+        install_packages(runner, missing, "missing prerequisites")
+
+
+def ensure_node_prerequisites(runner):
+    missing = []
+    if not runner.have("node"):
+        missing.append("nodejs")
+    if not runner.have("npm"):
+        missing.append("npm")
+    if missing:
+        say("missing node prerequisites: " + " ".join(missing))
+        if confirm(runner, "install them now?", default=True):
+            install_packages(runner, missing, "node prerequisites")
+
+
+def python_venv_available(runner):
+    if not runner.have("python3"):
+        return False
+    return runner.run("python3", "-c", "import ensurepip").ok
+
+
+def ensure_python_prerequisites(runner):
+    if runner.os_info.get("family") == "debian":
+        if python_venv_available(runner):
+            return
+        say("python3-venv is required to build a venv on Debian/Ubuntu")
+        if confirm(runner, "install python3-venv now?", default=True):
+            install_packages(runner, ["python3-venv"], "python prerequisites")
+    elif not runner.have("python3"):
+        if confirm(runner, "install python3 now?", default=True):
+            install_packages(runner, ["python3"], "python prerequisites")
+
+
+def ensure_deploy_user(runner):
+    home = runner.target(DEPLOY_HOME)
+    ensure_dir(runner, runner.target(CONFIG_DIR), 0o755)
+    ensure_dir(runner, runner.target(LIB_DIR), 0o755)
+    ensure_dir(runner, home, 0o755)
+    if user_exists(runner, DEPLOY_USER):
+        info = getent_passwd(runner, DEPLOY_USER) or {}
+        if info.get("shell") != "/bin/sh":
+            runner.mutate("usermod", "--shell", "/bin/sh", DEPLOY_USER)
+        else:
+            say(f"user {DEPLOY_USER} exists")
+    else:
+        runner.mutate("useradd", "--system", "--home-dir", DEPLOY_HOME, "--shell", "/bin/sh",
+                      "--comment", "ai-deploy forced-command account", DEPLOY_USER)
+    runner.mutate("passwd", "-l", DEPLOY_USER)
+    runner.mutate("chown", f"{DEPLOY_USER}:{DEPLOY_USER}", home)
+
+
+def install_package_files(runner):
+    install_source(runner, Path(__file__).resolve().parent / "gateway.py",
+                   runner.target(GATEWAY_PATH), 0o755)
+    install_source(runner, Path(__file__).resolve().parent / "compose-up.py",
+                   runner.target(COMPOSE_UP_PATH), 0o755)
+    version = package_version()
+    write_file(runner, runner.target(INSTALLED_VERSION_PATH), version + "\n", 0o644,
+               owner="root:root")
+
+
+def ensure_apps_json(runner):
+    path = runner.target(CONFIG_PATH)
+    if os.path.exists(path):
+        say(f"kept existing {path}")
+        return
+    write_file(runner, path, serialize_document(empty_document()), 0o644, owner="root:root")
+
+
+def write_deploy_authorized_keys(runner, keys, additive):
+    managed = existing_managed_keys(runner) if additive else []
+    lines = list(managed)
+    for key_type, blob in keys:
+        line = managed_authorized_keys_line(runner, key_type, blob)
+        if line not in lines:
+            lines.append(line)
+    content = "".join(line + "\n" for line in lines)
+    ssh_dir = os.path.join(runner.target(DEPLOY_HOME), ".ssh")
+    ensure_dir(runner, ssh_dir, 0o700)
+    write_file(runner, os.path.join(ssh_dir, "authorized_keys"), content, 0o600,
+               owner=f"{DEPLOY_USER}:{DEPLOY_USER}")
+
+
+def setup_admin_user(runner, args):
+    default_user = os.environ.get("SUDO_USER") or None
+    admin_user = args.admin_user or ask(
+        runner, "Admin user that can log in and run sudo", default=default_user, required=True)
+    sudo_group = "sudo" if runner.os_info.get("family") == "debian" else "wheel"
+    if user_exists(runner, admin_user):
+        say(f"user {admin_user} exists")
+    else:
+        runner.mutate("useradd", "-m", "-s", "/bin/bash", admin_user)
+        say(f"created user {admin_user}; set its password now")
+        runner.interactive("passwd", admin_user)
+    if not user_in_group(runner, admin_user, sudo_group):
+        runner.mutate("usermod", "-aG", sudo_group, admin_user)
+        say(f"added {admin_user} to the {sudo_group} group")
+    else:
+        say(f"{admin_user} is already in the {sudo_group} group")
+    warn_no_password(runner, admin_user)
+
+    if args.admin_key:
+        key_line = args.admin_key
+    elif runner.yes:
+        say(f"no --admin-key given: {admin_user}'s authorized_keys left unchanged (add the admin key later by "
+            f"re-running bootstrap with --admin-key)")
+        return admin_user
+    else:
+        key_line = ask(runner, "Paste the admin user's public key (ssh-ed25519 ...), or press Enter to skip",
+                       default="", required=False)
+        if not key_line:
+            say(f"skipped: {admin_user}'s authorized_keys left unchanged")
+            return admin_user
+    key_type, blob = validate_public_key(runner, key_line)
+    info = getent_passwd(runner, admin_user) or {}
+    home = info.get("home") or f"/home/{admin_user}"
+    home_target = runner.target(home) if home.startswith("/") else home
+    ssh_dir = os.path.join(home_target, ".ssh")
+    ensure_dir(runner, ssh_dir, 0o700)
+    auth_path = os.path.join(ssh_dir, "authorized_keys")
+    existing = read_file(auth_path, "") or ""
+    new_line = f"{key_type} {blob}"
+    if any(new_line in line for line in existing.splitlines()):
+        say(f"admin key already present in {auth_path}")
+    else:
+        content = existing.rstrip("\n")
+        content = (content + "\n" if content else "") + new_line + "\n"
+        write_file(runner, auth_path, content, 0o600)
+    runner.mutate("chown", f"{admin_user}:{admin_user}", ssh_dir, auth_path)
+    return admin_user
+
+
+def setup_root_login(runner, args):
+    if args.no_root_login_change:
+        say("root login change skipped (--no-root-login-change)")
+        return
+    dropin = runner.target(SSHD_DROPIN)
+    if args.root_login_change:
+        proceed = True
+    else:
+        say("To disable password/root SSH login safely, first log in AS the admin user in a "
+            "SECOND terminal and run `sudo -v`.")
+        proceed = confirm(runner, "Have you verified admin login in a second terminal?", default=False)
+    if not proceed:
+        say("leaving PermitRootLogin unchanged (drop-in not written)")
+        return
+    service = "ssh" if runner.os_info.get("family") == "debian" else "sshd"
+    if runner.check:
+        plan(f"write {dropin} (PermitRootLogin no)")
+        plan(f"sshd -t, then systemctl reload {service}")
+        return
+    write_file(runner, dropin,
+               f"# Managed by {PROG}: disable direct root SSH login\nPermitRootLogin no\n",
+               0o644, owner="root:root")
+    proc = runner.run("sshd", "-t")
+    if not proc.ok:
+        detail = (proc.err or proc.out).strip()
+        remove_file(runner, dropin)
+        raise Fail(f"sshd rejected the config; removed the drop-in: {detail or 'exit %d' % proc.rc}")
+    runner.mutate("systemctl", "reload", service)
+    say(f"PermitRootLogin no applied; reloaded {service}")
+
+
+def cmd_bootstrap(runner, args):
+    require_root(runner)
+    say(f"{PROG} {package_version()} bootstrap (root={runner.root}, check={runner.check})")
+    runner.os_info = detect_os(runner)
+    if runner.os_info.get("family") is None:
+        say("warning: /etc/os-release did not match a known family; package installation disabled")
+    bootstrap_prerequisites(runner)
+    ensure_deploy_user(runner)
+    install_package_files(runner)
+    ensure_apps_json(runner)
+
+    deploy_keys = []
+    additive = args.add_deploy_key is not None
+    if args.deploy_key:
+        deploy_keys.append(args.deploy_key)
+    if args.add_deploy_key:
+        deploy_keys.append(args.add_deploy_key)
+    if not deploy_keys:
+        if runner.yes:
+            raise Fail("--yes was given but no --deploy-key; pass --deploy-key", 2)
+        deploy_keys.append(ask(runner, "Paste the VM deploy public key (ssh-ed25519 ...)",
+                               required=True))
+    parsed = [validate_public_key(runner, key) for key in deploy_keys]
+    write_deploy_authorized_keys(runner, parsed, additive)
+    say(f"installed {len(parsed)} managed line(s) in {deploy_authorized_keys_path(runner)}")
+
+    setup_admin_user(runner, args)
+    setup_root_login(runner, args)
+    handle_selinux(runner)
+
+    say("")
+    say("SSH host key fingerprints:")
+    print_host_key_fingerprints(runner)
+    say("")
+    say("bootstrap complete")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# app add
+
+
+def app_exists(document, name):
+    return name in document.get("apps", {})
+
+
+def make_app_command_list(text):
+    try:
+        argv = shlex.split(text)
+    except ValueError as exc:
+        raise Fail(f"cannot parse command {text!r}: {exc}")
+    if not argv:
+        raise Fail("empty command")
+    return argv
+
+
+def resolve_executable(runner, argv):
+    if not argv:
+        raise Fail("empty start command")
+    if argv[0].startswith("/"):
+        return list(argv)
+    resolved = runner.which(argv[0])
+    if resolved is None:
+        if runner.test_mode:
+            return list(argv)
+        raise Fail(f"cannot resolve {argv[0]!r} to an absolute path; is it installed?")
+    return [resolved, *argv[1:]]
+
+
+def app_repo_host(repo):
+    match = re.match(r"^(?:ssh://)?(?:[^@/]+@)?([^:/]+)[:/]", repo)
+    return match.group(1) if match else ""
+
+
+def ensure_app_key(runner, name, app_root):
+    ssh_dir = os.path.join(app_root, ".ssh")
+    key = os.path.join(ssh_dir, "github_ed25519")
+    pub = key + ".pub"
+    ensure_dir(runner, ssh_dir, 0o700, owner=f"{DEPLOY_USER}:{DEPLOY_USER}")
+    comment = f"ai-deploy@{socket.gethostname()}:{name}"
+    if runner.check:
+        plan(f"ssh-keygen -t ed25519 -N '' -C {comment} -f {key}")
+        return key, pub
+    if os.path.exists(key):
+        say(f"keeping existing GitHub deploy key: {key}")
+    else:
+        runner.mutate("ssh-keygen", "-t", "ed25519", "-N", "", "-C", comment, "-f", key)
+        runner.mutate("chown", f"{DEPLOY_USER}:{DEPLOY_USER}", key, pub)
+    return key, pub
+
+
+def write_known_hosts(runner, app_root, repo, host_key_line=None):
+    path = os.path.join(app_root, ".ssh", "known_hosts")
+    host = app_repo_host(repo)
+    if host == "github.com":
+        content = "".join(line + "\n" for line in GITHUB_KNOWN_HOSTS)
+    else:
+        say(f"repository host {host!r} is not github.com; paste its SSH host key line")
+        line = host_key_line or ask(runner, f"{host} host key line (e.g. from ssh-keyscan {host})",
+                                    required=True)
+        validate_host_key_line(runner, line)
+        content = line.strip() + "\n"
+    write_file(runner, path, content, 0o644, owner=f"{DEPLOY_USER}:{DEPLOY_USER}")
+    return path
+
+
+def print_deploy_key_instructions(runner, name, pub_path):
+    public = read_file(pub_path, "") or ""
+    say("")
+    say("GitHub deploy key for this app:")
+    say("  " + (public.strip() or "(would be generated at " + pub_path + ")"))
+    say("Add it in GitHub -> the repository -> Settings -> Deploy keys -> Add deploy key:")
+    say(f"  title: ai-deploy {socket.gethostname()} {name} (leave 'Allow write access' unchecked)")
+    wait_enter(runner, "Press Enter once the deploy key is added (or skip the check below):")
+
+
+def git_ssh_command(key_path, known_hosts_path):
+    return ("ssh -F /dev/null -i " + shlex.quote(key_path)
+            + " -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes"
+            + " -o UserKnownHostsFile=" + shlex.quote(known_hosts_path))
+
+
+def test_git_remote(runner, key_path, known_hosts_path, repo):
+    if runner.check:
+        plan(f"test `git ls-remote {repo}` as {DEPLOY_USER} with the app key")
+        return True
+    env = dict(os.environ)
+    env["GIT_SSH_COMMAND"] = git_ssh_command(key_path, known_hosts_path)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    while True:
+        proc = runner.run("git", "ls-remote", repo, env=env)
+        if proc.ok:
+            say("git ls-remote succeeded")
+            return True
+        detail = [line for line in (proc.err or proc.out).strip().splitlines() if line.strip()]
+        text = " ".join(detail)
+        say("git ls-remote failed" + (": " + " | ".join(detail[-3:]) if detail else ""))
+        if "Permission denied (publickey)" in text or "Please make sure you have the correct access" in text:
+            say("  -> GitHub does not accept the key yet: add the public key above as a Deploy key of this "
+                "repository (read-only), then retry")
+        elif "Host key verification failed" in text:
+            say("  -> the repository host's key does not match the pinned known_hosts; do not continue "
+                "unless you verified the host key out of band")
+        if runner.yes:
+            say("warning: skipping the deploy-key check (--yes)")
+            return False
+        answer = _read("Press Enter to retry, or type 's' to skip: ").strip().lower()
+        if answer == "s":
+            say("warning: deploy-key check skipped")
+            return False
+
+
+def parse_env_args(values):
+    result = {}
+    for item in values or []:
+        key, sep, value = item.partition("=")
+        if not sep or not ENV_NAME_RE.fullmatch(key):
+            raise Fail(f"--env expects KEY=VALUE with a valid name, got {item!r}")
+        result[key] = value
+    return result
+
+
+def build_service_entry(runner, args, name, repo, app_root, key_path, known_hosts):
+    preset = args.preset
+    if preset is None:
+        preset = ask_choice(runner, "Service preset", ["node", "python", "custom"], "node")
+    if preset == "node":
+        ensure_node_prerequisites(runner)
+    elif preset == "python":
+        ensure_python_prerequisites(runner)
+    port = args.port
+    if port is None:
+        port = int(ask(runner, "Local port the app listens on",
+                       default="3000" if preset != "python" else "8000"))
+    if preset == "node":
+        default_build = [["npm", "ci"], ["npm", "run", "build"]]
+        default_start = ["/usr/bin/node", "server.js"]
+    elif preset == "python":
+        default_build = [["python3", "-m", "venv", ".venv"],
+                         [".venv/bin/pip", "install", "-r", "requirements.txt"]]
+        default_start = [app_root + "/current/.venv/bin/gunicorn", "-b",
+                         f"127.0.0.1:{port}", "app:app"]
+    else:
+        default_build = []
+        default_start = None
+    if args.no_build:
+        build = []
+    elif args.build:
+        build = [make_app_command_list(step) for step in args.build]
+    else:
+        build = [list(step) for step in default_build]
+    if args.start:
+        start = make_app_command_list(args.start)
+    elif default_start is not None:
+        start = list(default_start)
+    else:
+        start = make_app_command_list(ask(runner, "Start command (full command line)",
+                                          required=True))
+    start = resolve_executable(runner, start)
+    health_url = args.health_url
+    if health_url is None:
+        health_url = ask(runner, "Health check URL", default=f"http://127.0.0.1:{port}/")
+    entry = {
+        "kind": "service",
+        "repo": repo,
+        "sshKey": key_path,
+        "knownHosts": known_hosts,
+        "root": app_root,
+        "build": build,
+        "buildTimeout": 900,
+        "env": parse_env_args(args.env),
+        "unit": f"ai-app-{name}.service",
+        "mode": "system",
+        "health": {"type": "http", "url": health_url, "timeout": 5,
+                   "totalSeconds": 60, "interval": 2},
+        "aiDeploy": bool(args.ai_deploy),
+        "keep": args.keep if args.keep is not None else 5,
+    }
+    return entry, start, port
+
+
+def build_static_entry(runner, args, name, repo, app_root, key_path, known_hosts):
+    output_dir = args.static_dir or ask(runner, "Static output directory (inside the release)",
+                                        default="dist")
+    if args.no_build:
+        build = []
+    elif args.build:
+        build = [make_app_command_list(step) for step in args.build]
+    else:
+        build = []
+    health_url = args.health_url
+    entry = {
+        "kind": "static",
+        "repo": repo,
+        "sshKey": key_path,
+        "knownHosts": known_hosts,
+        "root": app_root,
+        "build": build,
+        "buildTimeout": 900,
+        "env": parse_env_args(args.env),
+        "unit": None,
+        "mode": "system",
+        "health": ({"type": "http", "url": health_url, "timeout": 5,
+                    "totalSeconds": 60, "interval": 2} if health_url else None),
+        "aiDeploy": bool(args.ai_deploy),
+        "keep": args.keep if args.keep is not None else 5,
+    }
+    return entry, output_dir
+
+
+def nginx_snippet(runner, name, app_root, output_dir, server_name):
+    root = f"{app_root}/current/{output_dir}".rstrip("/")
+    return (
+        f"# Managed by {PROG} for app {name}\n"
+        "server {\n"
+        "    listen 80;\n"
+        f"    server_name {server_name};\n"
+        f"    root {root};\n"
+        "    index index.html;\n"
+        "    location / {\n"
+        "        try_files $uri $uri/ =404;\n"
+        "    }\n"
+        "}\n"
+    )
+
+
+def setup_static_nginx(runner, args, name, app_root, output_dir):
+    if not runner.have("nginx"):
+        say("nginx is not installed; here is the server snippet to add by hand:")
+        say(nginx_snippet(runner, name, app_root, output_dir, name).rstrip())
+        say("")
+        say("# Caddy equivalent:")
+        say(f"# {app_root}/current/{output_dir} {{ file_server }}")
+        return
+    if args.no_nginx:
+        say("nginx detected but --no-nginx was given; snippet not written")
+        return
+    server_name = args.server_name or name
+    if not runner.yes and not confirm(runner, f"write an nginx server for {name}?", default=True):
+        return
+    path = runner.target(NGINX_CONF_DIR + f"/ai-app-{name}.conf")
+    write_file(runner, path, nginx_snippet(runner, name, app_root, output_dir, server_name),
+               0o644, owner="root:root")
+    if runner.check:
+        plan("nginx -t")
+        plan("systemctl reload nginx")
+        return
+    proc = runner.run("nginx", "-t")
+    if not proc.ok:
+        detail = (proc.err or proc.out).strip()
+        remove_file(runner, path)
+        raise Fail(f"nginx -t rejected the config; removed {path}: {detail or 'exit %d' % proc.rc}")
+    runner.mutate("systemctl", "reload", "nginx")
+    say("nginx config installed and reloaded")
+
+
+def build_compose_entry(runner, args, name, repo, app_root, key_path, known_hosts):
+    say("warning: a compose app restarts containers through a root-owned wrapper — treat it as "
+        "root-equivalent code from the repository.")
+    if runner.have("docker"):
+        proc = runner.run("docker", "compose", "version")
+        if not proc.ok:
+            say("warning: `docker compose version` failed; install the Docker compose plugin "
+                "(https://docs.docker.com) before deploying")
+    else:
+        say("warning: docker is not installed; install it from https://docs.docker.com "
+            "(ai-deploy-target does not install Docker)")
+    compose_file = args.compose_file or ask(runner, "Compose file (relative to the release)",
+                                            default="compose.yml")
+    if compose_file.startswith("/") or ".." in Path(compose_file).parts:
+        raise Fail("compose file must be a relative path without '..'")
+    health_url = args.health_url
+    entry = {
+        "kind": "compose",
+        "repo": repo,
+        "sshKey": key_path,
+        "knownHosts": known_hosts,
+        "root": app_root,
+        "build": [],
+        "buildTimeout": 900,
+        "env": parse_env_args(args.env),
+        "unit": None,
+        "mode": "system",
+        "health": ({"type": "http", "url": health_url, "timeout": 5,
+                    "totalSeconds": 60, "interval": 2} if health_url else None),
+        "aiDeploy": bool(args.ai_deploy),
+        "keep": args.keep if args.keep is not None else 5,
+        "compose": {"file": compose_file, "project": name},
+    }
+    return entry
+
+
+def setup_service_runtime(runner, name):
+    ensure_app_user(runner, name)
+    env_path = app_env_path(runner, name)
+    write_file(runner, env_path, "", 0o640, owner=f"root:app-{name}")
+    return env_path
+
+
+def install_service_unit(runner, name, start_argv, port):
+    unit = f"ai-app-{name}.service"
+    unit_path = runner.target(f"/etc/systemd/system/{unit}")
+    write_file(runner, unit_path, unit_content(runner, name, start_argv, port), 0o644,
+               owner="root:root")
+    reseed_systemd(runner)
+    runner.mutate("systemctl", "enable", unit)
+    say(f"unit {unit} written and enabled (it will start on the first deploy)")
+    return unit
+
+
+def cmd_app_add(runner, args):
+    require_root(runner)
+    runner.os_info = detect_os(runner)
+    name = args.name
+    if not APP_RE.fullmatch(name):
+        raise Fail("app name must match ^[a-z0-9][a-z0-9-]{0,31}$", 2)
+    document = load_document(runner) or empty_document()
+    if app_exists(document, name):
+        raise Fail(f"app {name} already exists; remove it first (`{PROG} app remove {name}`)")
+
+    kind = args.kind or ask_choice(runner, "App kind", ["service", "static", "compose"], "service")
+    if args.repo:
+        repo = args.repo
+    else:
+        repo = ask(runner, "Repository SSH URL (git@github.com:owner/repo.git)", required=True)
+    if repo.startswith("-") or not repo:
+        raise Fail("repository URL must be a non-empty string not starting with '-'")
+    local_repo = repo.startswith("/")
+    if not local_repo and not repo.startswith(("git@", "ssh://", "https://", "http://")):
+        say(f"warning: {repo!r} does not look like a git URL")
+    if not args.ai_deploy and not runner.yes:
+        if confirm(runner, "Allow AI-initiated deploys for this app?", default=False):
+            args.ai_deploy = True
+
+    app_root = app_root_path(runner, name)
+    ensure_dir(runner, app_root, 0o755, owner=f"{DEPLOY_USER}:{DEPLOY_USER}")
+    if local_repo:
+        # A repository on this machine (e.g. a bare repo): no SSH key, no host key.
+        say(f"local repository {repo}: no deploy key needed")
+        key_path = known_hosts = None
+    else:
+        key_path, pub_path = ensure_app_key(runner, name, app_root)
+        known_hosts = write_known_hosts(runner, app_root, repo, args.host_key_line)
+        print_deploy_key_instructions(runner, name, pub_path)
+        if not test_git_remote(runner, key_path, known_hosts, repo):
+            say("warning: continuing without a verified deploy key; the first deploy will fail until "
+                "the key is added to GitHub")
+
+    if kind == "service":
+        entry, start_argv, port = build_service_entry(runner, args, name, repo, app_root,
+                                                      key_path, known_hosts)
+    elif kind == "static":
+        entry, output_dir = build_static_entry(runner, args, name, repo, app_root, key_path,
+                                               known_hosts)
+    else:
+        entry = build_compose_entry(runner, args, name, repo, app_root, key_path, known_hosts)
+
+    document["apps"][name] = entry
+    # Validate the whole document before changing any other part of the system.
+    validate_document(runner, document)
+
+    if kind == "service":
+        setup_service_runtime(runner, name)
+        install_service_unit(runner, name, start_argv, port)
+    elif kind == "compose":
+        setup_service_runtime(runner, name)
+
+    regenerate_sudoers(runner, document)
+    install_document(runner, document)
+
+    if kind == "static":
+        setup_static_nginx(runner, args, name, app_root, output_dir)
+
+    say("")
+    say(f"app {name} ({kind}) configured")
+    say(f"  root:   {app_root}")
+    say(f"  repo:   {repo}")
+    say(f"  key:    {key_path}")
+    say(f"  aiDeploy: {entry['aiDeploy']}  keep: {entry['keep']}")
+    say("")
+    say("next: on the VM run `ai-remote status <machine>` and "
+        f"`ai-remote deploy <machine> {name} --sha <full sha>`")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# app remove / list
+
+
+def cmd_app_remove(runner, args):
+    require_root(runner)
+    runner.os_info = detect_os(runner)
+    name = args.name
+    if not APP_RE.fullmatch(name):
+        raise Fail("app name must match ^[a-z0-9][a-z0-9-]{0,31}$", 2)
+    document = load_document(runner)
+    if document is None or not app_exists(document, name):
+        raise Fail(f"app {name} is not configured in {runner.target(CONFIG_PATH)}")
+    if not confirm_action(runner, f"remove app {name}?"):
+        say("aborted")
+        return 0
+    entry = document["apps"].pop(name)
+    kind = entry.get("kind", "service")
+    if kind == "service" and entry.get("unit"):
+        runner.mutate("systemctl", "stop", entry["unit"], ignore_failure=True)
+        runner.mutate("systemctl", "disable", entry["unit"], ignore_failure=True)
+        remove_file(runner, runner.target(f"/etc/systemd/system/{entry['unit']}"))
+        reseed_systemd(runner)
+    if kind == "static":
+        snippet = runner.target(NGINX_CONF_DIR + f"/ai-app-{name}.conf")
+        if os.path.exists(snippet) or runner.check:
+            remove_file(runner, snippet)
+            if runner.have("nginx"):
+                runner.mutate("systemctl", "reload", "nginx", ignore_failure=True)
+    regenerate_sudoers(runner, document)
+    install_document(runner, document)
+    if args.purge:
+        remove_tree(runner, app_root_path(runner, name))
+        remove_file(runner, app_env_path(runner, name))
+        remove_tree(runner, runner.target("/var/lib/" + service_state_dir(name)))
+        if user_exists(runner, "app-" + name):
+            runner.mutate("userdel", "app-" + name, ignore_failure=True)
+    say(f"app {name} removed" + (" (purged)" if args.purge else ""))
+    return 0
+
+
+def cmd_app_list(runner, args):
+    document = load_document(runner)
+    if document is None:
+        say(f"no {runner.target(CONFIG_PATH)} found; run bootstrap first")
+        return 0
+    apps = document.get("apps", {})
+    if not apps:
+        say("no apps configured")
+        return 0
+    for name in sorted(apps):
+        app = apps[name]
+        unit = app.get("unit") or "-"
+        say(f"{name}\t{app.get('kind', 'service')}\t{unit}\taiDeploy={bool(app.get('aiDeploy'))}"
+            f"\t{app.get('repo', '')}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# doctor
+
+
+def http_health(url, timeout=3.0):
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": PROG, "Accept": "*/*"})
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return 200 <= response.status < 300, f"HTTP {response.status}"
+    except urllib.error.HTTPError as exc:
+        return False, f"HTTP {exc.code}"
+    except Exception as exc:  # noqa: BLE001 - doctor must never crash
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def cmd_doctor(runner, args):
+    runner.os_info = detect_os(runner)
+    failures = 0
+
+    def report(ok, message, warning=False):
+        nonlocal failures
+        if ok:
+            say("ok:   " + message)
+        elif warning:
+            say("warn: " + message)
+        else:
+            say("fail: " + message)
+            failures += 1
+
+    say(f"{PROG} {package_version()} doctor")
+    document = load_document(runner)
+    report(document is not None, f"{runner.target(CONFIG_PATH)} present")
+    if document is None:
+        say(f"doctor: {failures} problem(s)")
+        return 1
+    report(user_exists(runner, DEPLOY_USER), f"user {DEPLOY_USER} exists")
+
+    auth_path = deploy_authorized_keys_path(runner)
+    content = read_file(auth_path)
+    if content is None:
+        report(False, f"{auth_path} present")
+    else:
+        lines = [line for line in content.splitlines() if line.strip()]
+        prefix = 'restrict,command="' + gateway_command(runner) + '"'
+        bad = [line for line in lines if not line.startswith(prefix)]
+        report(not bad, f"{auth_path} contains only managed forced-command lines")
+        report(bool(lines), f"{auth_path} has at least one key")
+
+    gateway_file = runner.target(GATEWAY_PATH)
+    report(os.path.exists(gateway_file), f"gateway installed at {gateway_file}")
+    version_file = runner.target(INSTALLED_VERSION_PATH)
+    installed = read_file(version_file, "").strip() if os.path.exists(version_file) else ""
+    report(bool(installed), f"installed version {installed or 'missing'}")
+    for path, expected in ((gateway_file, 0o755), (version_file, 0o644)):
+        if os.path.exists(path):
+            actual = stat.S_IMODE(os.stat(path).st_mode)
+            report(actual == expected, f"{path} mode {actual:o} (want {expected:o})")
+    home = runner.target(DEPLOY_HOME)
+    if os.path.isdir(home):
+        actual = stat.S_IMODE(os.stat(home).st_mode)
+        report(actual == 0o755, f"{home} mode {actual:o} (want 755)")
+    if content is not None:
+        report(stat.S_IMODE(os.stat(auth_path).st_mode) == 0o600,
+               f"{auth_path} mode 600")
+
+    sudoers = runner.target(SUDOERS_PATH)
+    if os.path.exists(sudoers):
+        actual = stat.S_IMODE(os.stat(sudoers).st_mode)
+        report(actual == 0o440, f"{sudoers} mode {actual:o} (want 440)")
+        if runner.have("visudo"):
+            proc = runner.run("visudo", "-cf", sudoers)
+            report(proc.ok, f"visudo accepts {sudoers}")
+        else:
+            report(False, "visudo is not available to check sudoers")
+    else:
+        report(not document.get("apps"), "sudoers has no ai-deploy rules (no apps configured)",
+               warning=bool(document.get("apps")))
+
+    for name in sorted(document.get("apps", {})):
+        app = document["apps"][name]
+        kind = app.get("kind", "service")
+        root = app.get("root", "")
+        if app.get("sshKey"):
+            report(os.path.exists(app["sshKey"]), f"{name}: deploy key present")
+            if os.path.exists(app["sshKey"]):
+                actual = stat.S_IMODE(os.stat(app["sshKey"]).st_mode)
+                report(actual == 0o600, f"{name}: deploy key mode {actual:o} (want 600)")
+        if app.get("repo") and app.get("sshKey") and app.get("knownHosts") and runner.have("git"):
+            env = dict(os.environ)
+            env["GIT_SSH_COMMAND"] = git_ssh_command(app["sshKey"], app["knownHosts"])
+            env["GIT_TERMINAL_PROMPT"] = "0"
+            proc = runner.run("git", "ls-remote", app["repo"], env=env, timeout=20)
+            report(proc.ok, f"{name}: repo reachable ({app['repo']})", warning=True)
+        if kind == "service" and app.get("unit"):
+            state = runner.run("systemctl", "is-active", app["unit"])
+            active = state.out.strip() or ("active" if state.ok else "inactive")
+            report(state.ok or active in ("inactive", "failed"),
+                   f"{name}: unit {app['unit']} is {active}", warning=not state.ok)
+            report(os.path.islink(os.path.join(root, "current")),
+                   f"{name}: current release set", warning=True)
+        health = app.get("health")
+        if health and health.get("type") == "http":
+            ok, detail = http_health(health.get("url", ""))
+            report(ok, f"{name}: health {health.get('url')} -> {detail}", warning=True)
+
+    if runner.have("getenforce"):
+        mode = runner.run("getenforce").out.strip()
+        report(mode in ("Enforcing", "Permissive", "Disabled"), f"SELinux mode {mode}")
+        if mode == "Enforcing":
+            if runner.have("ausearch"):
+                avc = runner.run("ausearch", "-m", "avc", "-ts", "recent")
+                report(avc.ok, "recent AVC denials query", warning=True)
+            elif runner.have("journalctl"):
+                say("hint: check denials with `journalctl -t setroubleshoot` or `ausearch -m avc`")
+    else:
+        say("ok:   SELinux not present")
+
+    say("hint: if SSH connections are throttled on OpenSSH >= 9.8, set "
+        "`PerSourcePenalties no` in sshd_config")
+
+    if failures:
+        say(f"doctor: {failures} problem(s)")
+        return 1
+    say("doctor: no problems found")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# fingerprint / uninstall
+
+
+def cmd_fingerprint(runner, args):
+    files = host_key_files(runner)
+    if not files:
+        raise Fail("no /etc/ssh/ssh_host_*_key.pub found")
+    say("SSH host key fingerprints:")
+    print_host_key_fingerprints(runner)
+    return 0
+
+
+def cmd_uninstall(runner, args):
+    require_root(runner)
+    runner.os_info = detect_os(runner)
+    if not confirm_action(runner, f"uninstall {PROG} from this machine?"):
+        say("aborted")
+        return 0
+    document = load_document(runner)
+    if document:
+        for name in sorted(document.get("apps", {})):
+            app = document["apps"][name]
+            if app.get("kind", "service") == "service" and app.get("unit"):
+                runner.mutate("systemctl", "stop", app["unit"], ignore_failure=True)
+                runner.mutate("systemctl", "disable", app["unit"], ignore_failure=True)
+                remove_file(runner, runner.target(f"/etc/systemd/system/{app['unit']}"))
+            if app.get("kind") == "static":
+                remove_file(runner, runner.target(NGINX_CONF_DIR + f"/ai-app-{name}.conf"))
+        reseed_systemd(runner)
+    remove_file(runner, runner.target(SUDOERS_PATH))
+    remove_file(runner, runner.target(SSHD_DROPIN))
+    remove_file(runner, runner.target(GATEWAY_PATH))
+    remove_file(runner, runner.target(COMPOSE_UP_PATH))
+    remove_file(runner, runner.target(INSTALLED_VERSION_PATH))
+    if args.purge:
+        remove_file(runner, runner.target(CONFIG_PATH))
+        remove_file(runner, deploy_authorized_keys_path(runner))
+        if document:
+            for name in sorted(document.get("apps", {})):
+                remove_file(runner, app_env_path(runner, name))
+                remove_tree(runner, app_root_path(runner, name))
+                remove_tree(runner, runner.target("/var/lib/" + service_state_dir(name)))
+                if user_exists(runner, "app-" + name):
+                    runner.mutate("userdel", "app-" + name, ignore_failure=True)
+        if user_exists(runner, DEPLOY_USER):
+            runner.mutate("userdel", DEPLOY_USER, ignore_failure=True)
+        remove_tree(runner, runner.target(DEPLOY_HOME))
+    say(f"{PROG} uninstalled" + (" (purged data)" if args.purge else ""))
+    return 0
+
+
+# --------------------------------------------------------------------------
+# argument parsing / entry point
+
+
+def require_root(runner):
+    if runner.test_mode or runner.check:
+        return
+    if os.geteuid() != 0:
+        raise Fail("must run as root on the target (or use --check for a dry run)", 3)
+
+
+def add_common(parser, check=True, yes=True):
+    parser.add_argument("--root", default="/", metavar="DIR",
+                        help="test prefix (requires AI_DEPLOY_TARGET_TEST=1)")
+    if check:
+        parser.add_argument("--check", action="store_true", help="print the plan, change nothing")
+    if yes:
+        parser.add_argument("--yes", action="store_true",
+                            help="accept defaults (fails when a required answer has no default)")
+
+
+def make_runner(args):
+    root = getattr(args, "root", "/") or "/"
+    check = getattr(args, "check", False)
+    yes = getattr(args, "yes", False)
+    test_mode = False
+    if root != "/":
+        if os.environ.get("AI_DEPLOY_TARGET_TEST") != "1":
+            raise Fail("--root requires AI_DEPLOY_TARGET_TEST=1", 2)
+        if not os.path.isabs(root):
+            raise Fail("--root must be an absolute path", 2)
+        if not os.path.isdir(root):
+            raise Fail(f"--root {root} does not exist", 2)
+        root = root.rstrip("/") or "/"
+        test_mode = True
+    return Runner(root, test_mode, check, yes)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="Guided setup for an ai-deploy target (Debian/Ubuntu or Rocky Linux).",
+    )
+    parser.add_argument("--version", action="version",
+                        version=f"{PROG} {package_version()}")
+    sub = parser.add_subparsers(dest="command")
+
+    bootstrap = sub.add_parser("bootstrap", help="prepare this machine as a deploy target")
+    add_common(bootstrap)
+    bootstrap.add_argument("--deploy-key", metavar="KEY",
+                           help="VM deploy public key line (repeatable replacement)")
+    bootstrap.add_argument("--add-deploy-key", nargs="?", const="", default=None, metavar="KEY",
+                           help="add the key to the existing managed keys instead of replacing")
+    bootstrap.add_argument("--admin-user", metavar="NAME", help="existing (or new) sudo admin user")
+    bootstrap.add_argument("--admin-key", metavar="KEY", help="admin user's public key line")
+    bootstrap.add_argument("--no-root-login-change", action="store_true",
+                           help="leave PermitRootLogin unchanged")
+    bootstrap.add_argument("--root-login-change", action="store_true",
+                           help="apply the PermitRootLogin drop-in without the second-terminal ask")
+
+    app = sub.add_parser("app", help="manage configured apps")
+    app_sub = app.add_subparsers(dest="app_command")
+
+    add = app_sub.add_parser("add", help="configure a new app")
+    add.add_argument("name")
+    add_common(add)
+    add.add_argument("--kind", choices=["service", "static", "compose"])
+    add.add_argument("--repo", metavar="URL")
+    add.add_argument("--host-key-line", metavar="LINE",
+                     help="known_hosts line for a non-GitHub repository host")
+    add.add_argument("--preset", choices=["node", "python", "custom"])
+    add.add_argument("--build", action="append", metavar="STEP",
+                     help="build step command line (repeatable)")
+    add.add_argument("--no-build", action="store_true", help="configure no build steps")
+    add.add_argument("--start", metavar="CMD", help="service start command line")
+    add.add_argument("--port", type=int)
+    add.add_argument("--health-url", metavar="URL")
+    add.add_argument("--ai-deploy", action="store_true", help="allow AI-initiated deploys")
+    add.add_argument("--keep", type=int)
+    add.add_argument("--static-dir", metavar="DIR", help="static site output directory")
+    add.add_argument("--compose-file", metavar="FILE")
+    add.add_argument("--server-name", metavar="NAME", help="nginx server_name for static apps")
+    add.add_argument("--no-nginx", action="store_true", help="do not write an nginx config")
+    add.add_argument("--env", action="append", metavar="KEY=VALUE")
+
+    remove = app_sub.add_parser("remove", help="remove an app")
+    remove.add_argument("name")
+    add_common(remove)
+    remove.add_argument("--purge", action="store_true",
+                        help="also remove app data, user, env file and state dir")
+
+    listing = app_sub.add_parser("list", help="list configured apps")
+    add_common(listing, check=False, yes=False)
+
+    doctor = sub.add_parser("doctor", help="check the target state")
+    add_common(doctor, check=False, yes=False)
+
+    fingerprint = sub.add_parser("fingerprint", help="print SSH host key fingerprints")
+    add_common(fingerprint, check=False, yes=False)
+
+    uninstall = sub.add_parser("uninstall", help="remove the package from this machine")
+    add_common(uninstall)
+    uninstall.add_argument("--purge", action="store_true", help="also remove app data and users")
+
+    return parser
+
+
+HANDLERS = {
+    "bootstrap": cmd_bootstrap,
+    "doctor": cmd_doctor,
+    "fingerprint": cmd_fingerprint,
+    "uninstall": cmd_uninstall,
+}
+
+APP_HANDLERS = {
+    "add": cmd_app_add,
+    "remove": cmd_app_remove,
+    "list": cmd_app_list,
+}
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "command", None):
+        parser.print_help(sys.stderr)
+        return 2
+    try:
+        runner = make_runner(args)
+        if args.command == "app":
+            handler = APP_HANDLERS.get(getattr(args, "app_command", None))
+            if handler is None:
+                print("error: `app` needs one of: add, remove, list", file=sys.stderr)
+                return 2
+        else:
+            handler = HANDLERS[args.command]
+        return handler(runner, args)
+    except Fail as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return exc.code
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
