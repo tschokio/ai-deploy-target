@@ -48,7 +48,7 @@ import urllib.request
 from pathlib import Path
 
 PROG = "ai-deploy-target"
-FALLBACK_VERSION = "0.2.1"
+FALLBACK_VERSION = "0.2.2"
 APP_SCHEMA = "ai-deploy-apps/2"
 
 DEPLOY_USER = "ai-deploy"
@@ -926,7 +926,8 @@ def write_deploy_authorized_keys(runner, keys, additive):
             lines.append(line)
     content = "".join(line + "\n" for line in lines)
     ssh_dir = os.path.join(runner.target(DEPLOY_HOME), ".ssh")
-    ensure_dir(runner, ssh_dir, 0o700)
+    # sshd reads authorized_keys as ai-deploy: the 0700 .ssh directory must belong to it, not to root.
+    ensure_dir(runner, ssh_dir, 0o700, owner=f"{DEPLOY_USER}:{DEPLOY_USER}")
     write_file(runner, os.path.join(ssh_dir, "authorized_keys"), content, 0o600,
                owner=f"{DEPLOY_USER}:{DEPLOY_USER}")
 
@@ -1566,6 +1567,16 @@ def cmd_doctor(runner, args):
         bad = [line for line in lines if not line.startswith(prefix)]
         report(not bad, f"{auth_path} contains only managed forced-command lines")
         report(bool(lines), f"{auth_path} has at least one key")
+    if not runner.test_mode:
+        import pwd
+        try:
+            uid = pwd.getpwnam(DEPLOY_USER).pw_uid
+        except KeyError:
+            uid = None
+        for path in (runner.target(DEPLOY_HOME), os.path.dirname(auth_path), auth_path):
+            if uid is not None and os.path.exists(path):
+                owner = os.stat(path).st_uid
+                report(owner == uid, f"{path} owned by {DEPLOY_USER} (sshd refuses the key otherwise)")
 
     gateway_file = runner.target(GATEWAY_PATH)
     report(os.path.exists(gateway_file), f"gateway installed at {gateway_file}")
