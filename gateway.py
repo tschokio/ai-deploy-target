@@ -7,7 +7,7 @@ forced-command authorized_keys entry:
     restrict,command="/usr/local/lib/ai-deploy/gateway" ssh-ed25519 AAAA... ai-remote-<machine>
 
 It is the only thing a deploy key can execute. The operation name arrives in
-SSH_ORIGINAL_COMMAND (exactly one of status|deploy|restart|health|logs|rollback|history),
+SSH_ORIGINAL_COMMAND (exactly one of status|deploy|restart|health|logs|rollback|history|resolve),
 the request is a small JSON object on stdin, and every answer is a bounded JSON
 object on stdout with a schema version. The gateway never runs a shell: every
 command is an explicit argv, every path/service comes from the target-owned
@@ -57,16 +57,16 @@ def _package_version():
     try:
         text = (Path(__file__).resolve().parent / "VERSION").read_text(encoding="utf-8").strip()
     except OSError:
-        return "0.2.2"
-    return text or "0.2.2"
+        return "0.3.0"
+    return text or "0.3.0"
 
 
 VERSION = _package_version()
 SCHEMA = "ai-deploy/1"
 PROG = "ai-deploy-gateway"
 
-OPS = ("status", "deploy", "restart", "health", "logs", "rollback", "history")
-REQUEST_FIELDS = ("app", "sha", "ai", "lines", "since", "to")
+OPS = ("status", "deploy", "restart", "health", "logs", "rollback", "history", "resolve")
+REQUEST_FIELDS = ("app", "sha", "ai", "lines", "since", "to", "ref")
 REQUEST_CAP = 8 * 1024
 RESPONSE_CAP = 256 * 1024
 LOGS_CAP = 128 * 1024
@@ -98,6 +98,7 @@ RESTORECON_DEFAULT = "/usr/sbin/restorecon"
 SELINUX_ENFORCE = "/sys/fs/selinux/enforce"
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$")
 APP_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 RELEASE_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{7}(-[0-9]+)?$")
@@ -1093,6 +1094,61 @@ def op_history(request, apps):
     return {"ok": True, "apps": result}
 
 
+def validate_ref(ref):
+    """Validate a branch/tag/HEAD name for the resolve operation."""
+    if not isinstance(ref, str) or not REF_RE.fullmatch(ref) or ".." in ref or "@{" in ref \
+            or ref.endswith("/") or ref.endswith(".lock"):
+        raise GatewayError("bad_ref",
+                           "ref must be a branch, tag or HEAD: 1..100 chars, no '..', '@{', "
+                           "leading '-', trailing '/' or '.lock'")
+    return ref
+
+
+def _resolve_local_ref(cfg, paths, ref):
+    """Resolve ref to a commit SHA in the mirror. Raises ref_not_found."""
+    env = git_env(cfg, paths)
+    candidates = ["HEAD"] if ref == "HEAD" else [f"refs/heads/{ref}", f"refs/tags/{ref}"]
+    detail = ""
+    for candidate in candidates:
+        result = run_capped(
+            [git_bin(), f"--git-dir={paths.mirror}", "rev-parse", "--verify", "--quiet",
+             f"{candidate}^{{commit}}"],
+            timeout=60, env=env, cap=4096,
+        )
+        if result.ok:
+            sha = (result.out.strip().splitlines() or [""])[0].strip()
+            if SHA_RE.fullmatch(sha):
+                return sha
+        elif result.detail():
+            detail = result.detail()
+    raise GatewayError("ref_not_found",
+                       f"cannot resolve {ref!r}: {detail or 'no matching branch or tag'}")
+
+
+def op_resolve(request, apps):
+    """Read-only-ish: refresh the mirror under the app lock, then report the ref's commit."""
+    app = request["app"]
+    cfg = apps[app]
+    ref = validate_ref(request.get("ref") if request.get("ref") is not None else "HEAD")
+    paths = AppPaths(cfg)
+    paths.ensure_root()
+    with AppLock(paths.lock):
+        steps = []
+        ensure_mirror(cfg, paths, steps)
+        sha = _resolve_local_ref(cfg, paths, ref)
+        result = run_capped(
+            [git_bin(), f"--git-dir={paths.mirror}", "show", "-s", "--format=%s%n%cI", sha],
+            timeout=60, env=git_env(cfg, paths), cap=8192,
+        )
+    if not result.ok:
+        raise GatewayError("ref_not_found", f"cannot read commit {sha}: {result.detail()}")
+    lines = result.out.splitlines()
+    subject = redact(lines[0].strip()) if lines else ""
+    committed_at = lines[1].strip() if len(lines) > 1 else ""
+    return {"ok": True, "app": app, "ref": ref, "sha": sha,
+            "subject": subject[:200], "committed_at": committed_at}
+
+
 def op_deploy(request, apps):
     app = request["app"]
     cfg = apps[app]
@@ -1276,6 +1332,7 @@ DISPATCH = {
     "logs": op_logs,
     "rollback": op_rollback,
     "history": op_history,
+    "resolve": op_resolve,
 }
 
 
@@ -1318,6 +1375,9 @@ def parse_request(raw):
     if since is not None:
         if not isinstance(since, str) or len(since) > 40 or not SINCE_RE.fullmatch(since):
             raise GatewayError("invalid_request", "since must be like 1h, 30m, 2d or an ISO timestamp")
+    ref = request.get("ref")
+    if ref is not None and not isinstance(ref, str):
+        raise GatewayError("invalid_request", "ref must be a string")
     return request
 
 
@@ -1331,7 +1391,7 @@ def require_app(request, apps, op):
 
 
 def dispatch(op, request, apps):
-    if op in ("deploy", "restart", "health", "logs", "rollback"):
+    if op in ("deploy", "restart", "health", "logs", "rollback", "resolve"):
         require_app(request, apps, op)
     return DISPATCH[op](request, apps)
 

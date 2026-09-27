@@ -6,6 +6,8 @@ Run as root ON the target machine (the machine the forced-command gateway deploy
     sudo ./ai-deploy-target bootstrap
     sudo ./ai-deploy-target app add my-app
     sudo ./ai-deploy-target app list
+    sudo ./ai-deploy-target ai-ops enable --key "ssh-ed25519 …" --from 203.0.113.5
+    sudo ./ai-deploy-target ai-ops disable
     sudo ./ai-deploy-target doctor
     ./ai-deploy-target --version
 
@@ -29,10 +31,12 @@ install command) is reported when a required command is missing.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import getpass
 import glob
 import importlib.machinery
 import importlib.util
+import ipaddress
 import json
 import os
 import re
@@ -48,11 +52,18 @@ import urllib.request
 from pathlib import Path
 
 PROG = "ai-deploy-target"
-FALLBACK_VERSION = "0.2.2"
+FALLBACK_VERSION = "0.3.0"
 APP_SCHEMA = "ai-deploy-apps/2"
 
 DEPLOY_USER = "ai-deploy"
 DEPLOY_HOME = "/srv/ai-deploy"
+# TOTP-gated AI admin access (see docs/plan AI_ADMIN_ACCESS_PLAN.md): a system user with a
+# normal bash shell and a passwordless ALL sudo rule, reachable only with the VM-owned AI ops
+# key and (unless explicitly unrestricted) only from the given source addresses.
+AI_OPS_USER = "ai-ops"
+AI_OPS_HOME = "/var/lib/ai-ops"
+AI_OPS_SUDOERS_PATH = "/etc/sudoers.d/ai-ops"
+AI_OPS_MAX_SOURCES = 8
 LIB_DIR = "/usr/local/lib/ai-deploy"
 GATEWAY_PATH = LIB_DIR + "/gateway"
 COMPOSE_UP_PATH = LIB_DIR + "/compose-up"
@@ -1037,6 +1048,240 @@ def setup_root_login(runner, args, admin_user=None):
     say(f"undo: sudo rm {dropin} (then `systemctl reload {service}` if it is running)")
 
 
+# --------------------------------------------------------------------------
+# ai-ops (TOTP-gated AI admin access; see docs/plan AI_ADMIN_ACCESS_PLAN.md)
+
+
+def ssh_client_ip():
+    """The connecting client's IP from SSH_CLIENT, or None when not over SSH."""
+    value = (os.environ.get("SSH_CLIENT") or "").strip()
+    if not value:
+        return None
+    return value.split()[0]
+
+
+def ai_ops_ssh_dir(runner):
+    return os.path.join(runner.target(AI_OPS_HOME), ".ssh")
+
+
+def ai_ops_authorized_keys_path(runner):
+    return os.path.join(ai_ops_ssh_dir(runner), "authorized_keys")
+
+
+def parse_ai_ops_sources(value):
+    """Validate a comma-separated list of IPv4/IPv6 addresses or CIDRs (max 8).
+
+    Returns the tokens in order; an empty value means "any source".
+    """
+    text = (value or "").strip()
+    if not text:
+        return []
+    parts = [part.strip() for part in text.split(",")]
+    parts = [part for part in parts if part]
+    if len(parts) > AI_OPS_MAX_SOURCES:
+        raise Fail(f"--from accepts at most {AI_OPS_MAX_SOURCES} addresses/CIDRs "
+                   f"(got {len(parts)})", 2)
+    for part in parts:
+        try:
+            ipaddress.ip_network(part, strict=False)
+        except ValueError:
+            raise Fail(f"invalid --from address or CIDR {part!r} "
+                       f"(use e.g. 203.0.113.5 or 10.0.0.0/8)", 2)
+    return parts
+
+
+def ai_ops_managed_key_line(key_type, blob, sources):
+    options = []
+    if sources:
+        options.append('from="' + ",".join(sources) + '"')
+    options += ["no-port-forwarding", "no-agent-forwarding", "no-X11-forwarding"]
+    return ",".join(options) + f" {key_type} {blob} {AI_OPS_USER}"
+
+
+def say_any_source_warning():
+    say(f"WARNING: the {AI_OPS_USER} key is accepted from ANY source; restrict it with "
+        f"`--from <CIDR>` (e.g. the VM's IP) so a stolen key alone is not enough from anywhere")
+
+
+def ensure_ai_ops_user(runner):
+    home = runner.target(AI_OPS_HOME)
+    if user_exists(runner, AI_OPS_USER):
+        info = getent_passwd(runner, AI_OPS_USER) or {}
+        if info.get("shell") != "/bin/bash":
+            runner.mutate("usermod", "--shell", "/bin/bash", AI_OPS_USER)
+        else:
+            say(f"user {AI_OPS_USER} exists")
+    else:
+        runner.mutate("useradd", "--system", "--create-home", "--home-dir", AI_OPS_HOME,
+                      "--shell", "/bin/bash", AI_OPS_USER)
+    runner.mutate("passwd", "-l", AI_OPS_USER)
+    ensure_dir(runner, home, 0o700, owner=f"{AI_OPS_USER}:{AI_OPS_USER}")
+
+
+def write_ai_ops_authorized_keys(runner, key_type, blob, sources):
+    ssh_dir = ai_ops_ssh_dir(runner)
+    # sshd reads authorized_keys as ai-ops: the 0700 .ssh dir and the 0600 file must both
+    # belong to ai-ops (the same bug that once made sshd refuse the deploy user's key).
+    ensure_dir(runner, ssh_dir, 0o700, owner=f"{AI_OPS_USER}:{AI_OPS_USER}")
+    write_file(runner, ai_ops_authorized_keys_path(runner),
+               ai_ops_managed_key_line(key_type, blob, sources) + "\n", 0o600,
+               owner=f"{AI_OPS_USER}:{AI_OPS_USER}")
+
+
+def ai_ops_sudoers_content():
+    header = (f"# Managed by {PROG}: TOTP-gated AI admin access (revoke with "
+              f"`{PROG} ai-ops disable`). Do not edit by hand.\n")
+    return header + f"{AI_OPS_USER} ALL=(ALL:ALL) NOPASSWD: ALL\n"
+
+
+def install_ai_ops_sudoers(runner):
+    path = runner.target(AI_OPS_SUDOERS_PATH)
+    content = ai_ops_sudoers_content()
+    if runner.check:
+        plan(f"write {path} (mode 440) with:")
+        say(f"    {AI_OPS_USER} ALL=(ALL:ALL) NOPASSWD: ALL")
+        return
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    handle, tmp = tempfile.mkstemp(prefix=".ai-ops.sudoers.", dir=directory)
+    with os.fdopen(handle, "w", encoding="utf-8") as stream:
+        stream.write(content)
+    os.chmod(tmp, 0o440)
+    visudo = runner.which("visudo")
+    if visudo is None:
+        os.unlink(tmp)
+        raise Fail("visudo is not available" + runner.install_hint(("sudo",)))
+    proc = runner.run("visudo", "-cf", tmp)
+    if not proc.ok:
+        os.unlink(tmp)
+        detail = (proc.err or proc.out).strip()
+        raise Fail(f"visudo rejected the generated sudoers file: {detail or 'exit %d' % proc.rc}")
+    os.replace(tmp, path)
+    os.chmod(path, 0o440)
+    say(f"wrote: {path} (mode 440)")
+    say(f"    {AI_OPS_USER} ALL=(ALL:ALL) NOPASSWD: ALL")
+
+
+def handle_selinux_ai_ops(runner):
+    if not runner.have("getenforce"):
+        return
+    mode = runner.run("getenforce").out.strip()
+    if mode not in ("Enforcing", "Permissive"):
+        return
+    pattern = r"/var/lib/ai-ops/\.ssh(/.*)?"
+    if not runner.have("semanage"):
+        say("warning: semanage is not available; install policycoreutils-python-utils and re-run")
+        return
+    added = runner.mutate("semanage", "fcontext", "-a", "-t", "ssh_home_t", pattern,
+                          ignore_failure=True)
+    if not added.ok and not runner.check:
+        runner.mutate("semanage", "fcontext", "-m", "-t", "ssh_home_t", pattern,
+                      ignore_failure=True)
+    runner.mutate("restorecon", "-R", runner.target(AI_OPS_HOME), ignore_failure=True)
+
+
+def enable_ai_ops(runner, key_line, source_value):
+    """Validate and install AI ops access, changing nothing when the input is invalid."""
+    key_type, blob = validate_public_key(runner, key_line)
+    sources = parse_ai_ops_sources(source_value)
+    # visudo-check the sudoers rule first: a bad rule then leaves no user, no key and no rule.
+    install_ai_ops_sudoers(runner)
+    ensure_ai_ops_user(runner)
+    write_ai_ops_authorized_keys(runner, key_type, blob, sources)
+    handle_selinux_ai_ops(runner)
+    return key_type, blob, sources
+
+
+def report_ai_ops_enabled(sources):
+    say(f"AI ops access enabled: {AI_OPS_USER} may log in with the AI ops key"
+        + (f" from {', '.join(sources)}" if sources else " from any source"))
+    say(f"on the VM: grant with `ai-remote admin grant <machine>` (60 min); revoke on the target "
+        f"with `{PROG} ai-ops disable`")
+
+
+def setup_ai_ops(runner, args):
+    key_line = args.ai_ops_key
+    if key_line is None:
+        if runner.yes:
+            say("no --ai-ops-key given: TOTP-gated AI admin access not configured")
+            return
+        key_line = ask(runner, "Paste the AI ops public key (ssh-ed25519 ...), or press Enter to skip",
+                       default="", required=False)
+        if not key_line:
+            say("skipped: TOTP-gated AI admin access not configured")
+            return
+    source_value = args.ai_ops_from
+    if source_value is None:
+        default_source = ssh_client_ip() or ""
+        if runner.yes:
+            source_value = default_source
+        else:
+            source_value = ask(runner,
+                               "Restrict the AI ops key to source address/CIDR(s) "
+                               "(comma-separated, max 8), or Enter for any source",
+                               default=default_source or None, required=False) or ""
+    _, _, sources = enable_ai_ops(runner, key_line, source_value)
+    if not sources:
+        say_any_source_warning()
+    report_ai_ops_enabled(sources)
+
+
+def cmd_ai_ops_enable(runner, args):
+    require_root(runner)
+    runner.os_info = detect_os(runner)
+    key_line = args.key
+    if not key_line:
+        key_line = ask(runner, "Paste the AI ops public key (ssh-ed25519 ...)", required=True)
+    _, _, sources = enable_ai_ops(runner, key_line, args.source)
+    if not sources:
+        say_any_source_warning()
+    report_ai_ops_enabled(sources)
+    return 0
+
+
+def cmd_ai_ops_disable(runner, args):
+    require_root(runner)
+    runner.os_info = detect_os(runner)
+    if not confirm_action(runner, "disable AI ops access (remove sudoers and authorized_keys)?"):
+        say("aborted")
+        return 0
+    remove_file(runner, runner.target(AI_OPS_SUDOERS_PATH))
+    remove_file(runner, ai_ops_authorized_keys_path(runner))
+    if user_exists(runner, AI_OPS_USER):
+        shell = nologin_path(runner)
+        runner.mutate("passwd", "-l", AI_OPS_USER)
+        runner.mutate("usermod", "--shell", shell, AI_OPS_USER)
+        say(f"{AI_OPS_USER} kept, password locked and shell set to {shell}")
+    else:
+        say(f"user {AI_OPS_USER} does not exist")
+    say("AI ops access disabled")
+    return 0
+
+
+def cmd_ai_ops_status(runner, args):
+    runner.os_info = detect_os(runner)
+    user = user_exists(runner, AI_OPS_USER)
+    auth_path = ai_ops_authorized_keys_path(runner)
+    content = read_file(auth_path)
+    sudoers = runner.target(AI_OPS_SUDOERS_PATH)
+    sources = ""
+    for line in (content or "").splitlines():
+        match = re.search(r'from="([^"]*)"', line)
+        if match:
+            sources = match.group(1)
+    say(f"{PROG} {package_version()} ai-ops status")
+    say(f"user:     {AI_OPS_USER} " + ("present" if user else "missing"))
+    if user:
+        info = getent_passwd(runner, AI_OPS_USER) or {}
+        say(f"shell:    {info.get('shell') or '(unknown)'}")
+    say(f"key:      {auth_path} " + ("present" if content is not None else "missing"))
+    say(f"from:     {sources or '(any source — unrestricted)'}")
+    say(f"sudoers:  {sudoers} " + ("present" if os.path.exists(sudoers) else "missing"))
+    enabled = bool(user and content is not None and os.path.exists(sudoers))
+    say(f"state:    {'enabled' if enabled else 'disabled'}")
+    return 0
+
+
 def cmd_bootstrap(runner, args):
     require_root(runner)
     say(f"{PROG} {package_version()} bootstrap (root={runner.root}, check={runner.check})")
@@ -1065,6 +1310,7 @@ def cmd_bootstrap(runner, args):
 
     admin_user = setup_admin_user(runner, args)
     setup_root_login(runner, args, admin_user)
+    setup_ai_ops(runner, args)
     handle_selinux(runner)
 
     say("")
@@ -1535,6 +1781,36 @@ def http_health(url, timeout=3.0):
         return False, f"{type(exc).__name__}: {exc}"
 
 
+def parse_sshd_allow(output):
+    """Return (AllowUsers, AllowGroups) from `sshd -T` output."""
+    allow_users = []
+    allow_groups = []
+    for raw in output.splitlines():
+        key, _, value = raw.strip().partition(" ")
+        key = key.lower()
+        if key == "allowusers":
+            allow_users = value.split()
+        elif key == "allowgroups":
+            allow_groups = value.split()
+    return allow_users, allow_groups
+
+
+def sshd_allow_excludes(runner, account, allow_users, allow_groups):
+    """A message when sshd AllowUsers/AllowGroups would lock `account` out, else None."""
+    def allowed(patterns):
+        for pattern in patterns:
+            pattern = pattern.split("@", 1)[0]
+            if pattern == account or fnmatch.fnmatch(account, pattern):
+                return True
+        return False
+
+    if allow_users and not allowed(allow_users):
+        return f"sshd AllowUsers ({' '.join(allow_users)}) excludes {account}"
+    if allow_groups and not any(user_in_group(runner, account, group) for group in allow_groups):
+        return f"sshd AllowGroups ({' '.join(allow_groups)}) excludes {account}"
+    return None
+
+
 def cmd_doctor(runner, args):
     runner.os_info = detect_os(runner)
     failures = 0
@@ -1594,6 +1870,67 @@ def cmd_doctor(runner, args):
     if content is not None:
         report(stat.S_IMODE(os.stat(auth_path).st_mode) == 0o600,
                f"{auth_path} mode 600")
+
+    # AI ops (optional): user/key/sudoers/ownership/modes and the from= restriction. A normal
+    # `ai-ops disable` keeps the locked account but removes the key and the rule: that is a
+    # healthy disabled state, not a failure.
+    ai_ops_user = user_exists(runner, AI_OPS_USER)
+    ai_ops_auth = ai_ops_authorized_keys_path(runner)
+    ai_ops_dir = ai_ops_ssh_dir(runner)
+    ai_ops_sudoers = runner.target(AI_OPS_SUDOERS_PATH)
+    ai_ops_content = read_file(ai_ops_auth)
+    ai_ops_key_present = ai_ops_content is not None
+    ai_ops_sudoers_present = os.path.exists(ai_ops_sudoers)
+    if not ai_ops_key_present and not ai_ops_sudoers_present:
+        say(f"ok:   ai-ops access disabled "
+            f"({'locked account kept' if ai_ops_user else 'not configured'})")
+    else:
+        report(ai_ops_user, f"user {AI_OPS_USER} exists")
+        report(ai_ops_key_present and ai_ops_sudoers_present,
+               f"ai-ops access enabled (key={'yes' if ai_ops_key_present else 'no'}, "
+               f"sudoers={'yes' if ai_ops_sudoers_present else 'no'})")
+        if ai_ops_key_present:
+            ai_ops_lines = [line for line in ai_ops_content.splitlines() if line.strip()]
+            report(len(ai_ops_lines) == 1, f"{ai_ops_auth} has exactly one managed key line")
+            report(any('from="' in line for line in ai_ops_lines),
+                   f"{ai_ops_auth} restricts the key with from=", warning=True)
+            report(stat.S_IMODE(os.stat(ai_ops_auth).st_mode) == 0o600,
+                   f"{ai_ops_auth} mode 600")
+            if os.path.isdir(ai_ops_dir):
+                report(stat.S_IMODE(os.stat(ai_ops_dir).st_mode) == 0o700,
+                       f"{ai_ops_dir} mode 700")
+        if ai_ops_sudoers_present:
+            actual = stat.S_IMODE(os.stat(ai_ops_sudoers).st_mode)
+            report(actual == 0o440, f"{ai_ops_sudoers} mode {actual:o} (want 440)")
+            if runner.have("visudo"):
+                proc = runner.run("visudo", "-cf", ai_ops_sudoers)
+                report(proc.ok, f"visudo accepts {ai_ops_sudoers}")
+            else:
+                report(False, "visudo is not available to check the ai-ops sudoers file")
+        if not runner.test_mode and ai_ops_user:
+            import pwd
+            try:
+                ai_ops_uid = pwd.getpwnam(AI_OPS_USER).pw_uid
+            except KeyError:
+                ai_ops_uid = None
+            for path in (runner.target(AI_OPS_HOME), ai_ops_dir, ai_ops_auth):
+                if ai_ops_uid is not None and os.path.exists(path):
+                    owner = os.stat(path).st_uid
+                    report(owner == ai_ops_uid,
+                           f"{path} owned by {AI_OPS_USER} (sshd refuses the key otherwise)")
+
+    if runner.have("sshd"):
+        proc = runner.run("sshd", "-T")
+        if proc.ok:
+            allow_users, allow_groups = parse_sshd_allow(proc.out)
+            if allow_users or allow_groups:
+                for account in (DEPLOY_USER, AI_OPS_USER):
+                    problem = sshd_allow_excludes(runner, account, allow_users, allow_groups)
+                    report(problem is None,
+                           problem or f"sshd AllowUsers/AllowGroups allows {account}",
+                           warning=True)
+        else:
+            say("warn: `sshd -T` failed; cannot check AllowUsers/AllowGroups")
 
     sudoers = runner.target(SUDOERS_PATH)
     if os.path.exists(sudoers):
@@ -1764,6 +2101,11 @@ def build_parser():
                            help="add the key to the existing managed keys instead of replacing")
     bootstrap.add_argument("--admin-user", metavar="NAME", help="existing (or new) sudo admin user")
     bootstrap.add_argument("--admin-key", metavar="KEY", help="admin user's public key line")
+    bootstrap.add_argument("--ai-ops-key", metavar="KEY",
+                           help="AI ops public key line (enables TOTP-gated AI admin access)")
+    bootstrap.add_argument("--ai-ops-from", metavar="CIDR",
+                           help="comma-separated source addresses/CIDRs allowed to use the AI ops "
+                                "key (max 8; default: this SSH client's IP)")
     bootstrap.add_argument("--no-root-login-change", action="store_true",
                            help="leave PermitRootLogin unchanged")
     bootstrap.add_argument("--root-login-change", action="store_true",
@@ -1803,6 +2145,23 @@ def build_parser():
     listing = app_sub.add_parser("list", help="list configured apps")
     add_common(listing, check=False, yes=False)
 
+    ai_ops = sub.add_parser("ai-ops", help="manage TOTP-gated AI admin access")
+    ai_ops_sub = ai_ops.add_subparsers(dest="ai_ops_command")
+
+    ai_ops_enable = ai_ops_sub.add_parser(
+        "enable", help="install the ai-ops key and passwordless sudo rule")
+    add_common(ai_ops_enable)
+    ai_ops_enable.add_argument("--key", metavar="KEY", help="AI ops public key line")
+    ai_ops_enable.add_argument("--from", dest="source", metavar="CIDR",
+                               help="comma-separated source addresses/CIDRs allowed (max 8)")
+
+    ai_ops_disable = ai_ops_sub.add_parser(
+        "disable", help="remove the ai-ops key and sudo rule and lock the account")
+    add_common(ai_ops_disable)
+
+    ai_ops_status = ai_ops_sub.add_parser("status", help="show the AI ops access state")
+    add_common(ai_ops_status, check=False, yes=False)
+
     doctor = sub.add_parser("doctor", help="check the target state")
     add_common(doctor, check=False, yes=False)
 
@@ -1829,6 +2188,12 @@ APP_HANDLERS = {
     "list": cmd_app_list,
 }
 
+AI_OPS_HANDLERS = {
+    "enable": cmd_ai_ops_enable,
+    "disable": cmd_ai_ops_disable,
+    "status": cmd_ai_ops_status,
+}
+
 
 def main(argv=None):
     parser = build_parser()
@@ -1842,6 +2207,11 @@ def main(argv=None):
             handler = APP_HANDLERS.get(getattr(args, "app_command", None))
             if handler is None:
                 print("error: `app` needs one of: add, remove, list", file=sys.stderr)
+                return 2
+        elif args.command == "ai-ops":
+            handler = AI_OPS_HANDLERS.get(getattr(args, "ai_ops_command", None))
+            if handler is None:
+                print("error: `ai-ops` needs one of: enable, disable, status", file=sys.stderr)
                 return 2
         else:
             handler = HANDLERS[args.command]
